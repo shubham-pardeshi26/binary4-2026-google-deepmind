@@ -52,6 +52,31 @@ const POSES = [
 ];
 STYLES.forEach((s, i) => (s.pose = POSES[i]));
 
+// One short, original audition line per casting type (~8s of speech). Editable in the UI.
+const LINES = {
+  corporate: "I've read every number in this report, and I'm telling you: we can still win this.",
+  commercial: "Honestly? I didn't think coffee could fix my morning. Then I tried this one.",
+  theatrical: 'You ask me what I lost that night. Everything. And I would lose it all again.',
+  romlead: 'I kept telling myself it was nothing. Then you walked in, and it was everything.',
+  villain: 'You think this is the part where I lose? No. This is where it begins.',
+  editorial: "Don't look at the clothes. Look at me. That's the whole point.",
+  detective: 'Three witnesses, one story, and not a single one of them is telling the truth.',
+  doctor: "Your results came back. Sit down. It's good news, but you'll want to sit.",
+  period: 'My lord, I have kept your secret for twenty years. Tonight, I will not.',
+  scifi: "The signal isn't coming from out there. It's coming from inside the ship.",
+  bw: "I've waited my whole life for a moment like this. I'm not wasting it.",
+  golden: 'Remember this summer? We said we would never grow up. Look at us now.',
+  musician: 'Every song I ever wrote was about this town. Tonight, I finally leave it.',
+  athlete: "They said I was finished. This is my last game, and I'm winning it.",
+  comedic: 'Okay, in my defense, the goat was already on the roof when I got there.',
+  noir: 'She walked in with trouble in her eyes, and I was fool enough to listen.',
+  daytime: "You can't marry him, Victoria. Not when you know he's my brother.",
+  action: "Ninety seconds before this place goes up. Stay close, and don't look back.",
+  fantasy: 'The prophecy never said I would be a hero. Only that I would choose.',
+  founder: "We're not building an app. We're fixing the thing everyone quietly hates.",
+};
+STYLES.forEach(s => (s.line = LINES[s.id]));
+
 const LIGHTS = [
   { id: 'softkey', name: 'Soft key', desc: 'large soft key light', filter: 'brightness(1.05)' },
   { id: 'rembrandt', name: 'Rembrandt', desc: 'Rembrandt lighting, triangle of light on the cheek', filter: 'contrast(1.15) brightness(.92)' },
@@ -70,7 +95,7 @@ const LOOKS = [
 const role = s => s.name.split(' · ')[0];
 export const prompts = {
   image: s => `Create a new professional ${role(s)} casting headshot of the person in this photo: ${s.desc}. Pose: ${s.pose}. Preserve their exact face, identity, age, skin tone and features. Change the pose, wardrobe, lighting, background and expression to match. Photorealistic 85mm portrait, casting quality.`,
-  video: (s, edits) => [`In a single continuous shot, no scene cuts: a casting reel of this exact person as a ${role(s)} type (${s.desc}). They face the camera, slowly turn to show their left and right profiles, then give a natural smile followed by a serious take. Keep their face and identity exactly as in the image. No speech, no music.`, ...edits.map(e => `Direction: ${e}.`)].join(' '),
+  video: (s, edits, line = s.line) => [`In a single continuous shot, no scene cuts: a casting audition tape of this exact person as a ${role(s)} type (${s.desc}). Framed from the chest up, they look into the camera and deliver this line with a ${s.tags.slice(0, 2).join(' and ')} performance: "${line}" Natural lip-sync, expressive face, small natural head movements. Keep their face and identity exactly as in the image. Audio: only their voice and quiet room tone, no music.`, ...edits.map(e => `Direction: ${e}.`)].join(' '),
   edit: e => `${e}. Keep everything else the same.`,
   music: (s, edits) => [`Subtle instrumental underscore for an actor's ${role(s)} casting reel (${s.tags.join(', ')}), ${s.mood.major ? 'warm, major key' : 'tense, minor key'}, inspired by the mood of this headshot, unobtrusive. Instrumental only, no vocals. About 30 seconds.`, ...edits.map(e => `Mood direction: ${e}.`)].join(' '),
 };
@@ -199,7 +224,7 @@ async function interact(body) {
 }
 
 const block = dataUrl => { const { mimeType, data } = inline(dataUrl); return { type: 'image', mime_type: mimeType, data }; };
-const VIDEO_FORMAT = { type: 'video', aspect_ratio: '16:9', resolution: '720p' };
+const VIDEO_FORMAT = { type: 'video', aspect_ratio: '16:9', resolution: process.env.VIDEO_RES || '720p' }; // VIDEO_RES=360p if 720p exceeds the ~4MB inline limit
 
 const live = {
   mock: false,
@@ -208,9 +233,9 @@ const live = {
     return { src: await imageSlot(() => generateImage(prompt, image)), prompt };
   },
   // First take: headshot + full direction. Later takes: Omni's stateful edit of the previous video.
-  async reel(image, style, edits, prevId) {
+  async reel(image, style, edits, prevId, line) {
     const edit = prevId && edits.at(-1);
-    const prompt = edit ? prompts.edit(edit) : prompts.video(style, edits);
+    const prompt = edit ? prompts.edit(edit) : prompts.video(style, edits, line);
     const j = await interact({
       model: MODELS.video,
       ...(edit ? { previous_interaction_id: prevId, input: prompt } : { input: [block(image), { type: 'text', text: prompt }] }),
@@ -229,9 +254,9 @@ const live = {
 const mock = {
   mock: true,
   async stage(image, style) { await sleep(jitter(700, 2200)); return { src: null, prompt: prompts.image(style) }; },
-  async reel(image, style, edits, prevId) {
+  async reel(image, style, edits, prevId, line) {
     await sleep(jitter(2500, 4000));
-    return { src: null, id: 'mock', ...applyEdits(style, edits), prompt: prevId && edits.length ? prompts.edit(edits.at(-1)) : prompts.video(style, edits) };
+    return { src: null, id: 'mock', ...applyEdits(style, edits), prompt: prevId && edits.length ? prompts.edit(edits.at(-1)) : prompts.video(style, edits, line) };
   },
   async music(image, style, edits) { await sleep(jitter(1200, 2000)); return { src: null, mood: applyEdits(style, edits).mood, prompt: prompts.music(style, edits) }; },
 };
@@ -272,7 +297,10 @@ async function stage(req, res) {
 const routes = {
   'GET /api/config': async () => ({ mock: ai.mock }),
   'POST /api/taste': async ({ liked, disliked }) => tasteFrom(liked, disliked),
-  'POST /api/reel': async ({ image, style, edits = [], prevId }) => ai.reel(image, style, edits, prevId),
+  'POST /api/reel': async ({ image, style, edits = [], prevId, line }) => {
+    line = typeof line === 'string' ? line.trim().slice(0, 300) : '';
+    return ai.reel(image, style, edits, prevId, line || style?.line);
+  },
   'POST /api/music': async ({ image, style, edits = [] }) => ai.music(image, style, edits),
 };
 

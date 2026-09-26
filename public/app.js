@@ -1,5 +1,5 @@
 const $ = s => document.querySelector(s);
-const S = { source: null, batch: [], round: 1, liked: [], disliked: [], deck: 0, pick: null, edits: [], music: null, muted: false, busy: false, ctl: null, reelRun: 0, reelId: null, slate: null };
+const S = { source: null, batch: [], round: 1, liked: [], disliked: [], deck: 0, pick: null, edits: [], music: null, muted: false, busy: false, ctl: null, reelRun: 0, reelId: null, line: '', slate: null };
 let images = 0, actx, stopAudio = () => {};
 
 const show = id => document.querySelectorAll('main > section').forEach(s => (s.hidden = s.id !== id));
@@ -217,8 +217,20 @@ $('#toReel').onclick = () => {
   actx.resume();
   S.edits = [];
   S.reelId = null;
+  S.line = $('#line').value = S.pick.style.line;
   reel();
 };
+
+// A new line is a fresh take (not an edit): Omni re-performs from the headshot.
+$('#lineForm').onsubmit = e => {
+  e.preventDefault();
+  S.line = $('#line').value.trim();
+  S.edits = [];
+  S.reelId = null;
+  reel();
+};
+
+const stopTake = () => { $('.screen video')?.pause(); speechSynthesis.cancel(); };
 
 async function reel() {
   const run = ++S.reelRun; // a newer edit or leaving the screen makes older results stale
@@ -227,10 +239,11 @@ async function reel() {
   $('#reel h2').textContent = style.name;
   $('#edits').replaceChildren(...S.edits.map(e => make('li', { textContent: e })));
   $('.screen').classList.add('loading');
+  stopTake();
   const label = S.edits.length ? `edit ${S.edits.length}…` : 'rendering…';
   await Promise.all([
     // prevId → Omni edits its previous take ("keep everything else the same") instead of starting over.
-    step('omni', label, post('/api/reel', { image: src || S.source, style, edits: S.edits, prevId: S.edits.length ? S.reelId : null }), (_, s) => `${s}s`)
+    step('omni', label, post('/api/reel', { image: src || S.source, style, edits: S.edits, prevId: S.edits.length ? S.reelId : null, line: S.line }), (_, s) => `${s}s`)
       .then(v => run === S.reelRun && showVideo(v)),
     step('lyria', 'scoring…', post('/api/music', { image: src || S.source, style, edits: S.edits }), (_, s) => `${s}s`).then(m => run === S.reelRun && playMusic(m)),
   ]).catch(e => { if (run === S.reelRun) $('.screen').classList.remove('loading'); throw e; });
@@ -240,8 +253,15 @@ function showVideo(v) {
   S.reelId = v.id;
   const screen = $('.screen');
   screen.classList.remove('loading');
-  if (v.src) screen.replaceChildren(make('video', { src: v.src, autoplay: true, loop: true, muted: true, playsInline: true, controls: true }));
-  else screen.replaceChildren(Object.assign(media(null, v), { className: 'media mocked turn' }));
+  if (v.src) {
+    // The take has dialogue, so play with sound; browsers may refuse unmuted autoplay, then fall back to muted.
+    const vid = make('video', { src: v.src, loop: true, muted: S.muted, playsInline: true, controls: true });
+    screen.replaceChildren(vid);
+    vid.play().catch(() => { vid.muted = true; vid.play(); toast('Click the video’s speaker icon to hear the line.'); });
+  } else {
+    screen.replaceChildren(Object.assign(media(null, v), { className: 'media mocked turn' }));
+    if (!S.muted) speechSynthesis.speak(new SpeechSynthesisUtterance(S.line)); // mock stand-in for Omni's generated voice
+  }
   $('#pOmni').textContent = `Omni: ${v.prompt}`;
 }
 
@@ -251,7 +271,7 @@ function playMusic(m) {
   stopAudio();
   if (S.muted) return;
   if (m.src) {
-    const a = make('audio', { src: m.src, loop: true });
+    const a = make('audio', { src: m.src, loop: true, volume: 0.2 }); // quiet bed under the dialogue
     a.play().catch(() => toast('Click “Sound on” to play the score.'));
     stopAudio = () => a.pause();
   } else stopAudio = synth(m.mood);
@@ -262,7 +282,7 @@ function synth({ root, major }) {
   const t = actx.currentTime;
   const out = actx.createGain();
   out.gain.setValueAtTime(0, t);
-  out.gain.linearRampToValueAtTime(0.1, t + 3);
+  out.gain.linearRampToValueAtTime(0.05, t + 3);
   out.connect(actx.destination);
   const lp = actx.createBiquadFilter();
   lp.frequency.value = 900;
@@ -326,7 +346,10 @@ $('#mute').onclick = () => {
   S.muted = !S.muted;
   $('#mute').textContent = S.muted ? '🔇 Sound off' : '🔊 Sound on';
   S.muted ? stopAudio() : S.music && playMusic(S.music);
+  const vid = $('.screen video');
+  if (vid) vid.muted = S.muted;
+  if (S.muted) speechSynthesis.cancel();
 };
-$('#back').onclick = () => { S.reelRun++; stopAudio(); show('grid'); };
+$('#back').onclick = () => { S.reelRun++; stopAudio(); stopTake(); show('grid'); };
 
 fetch('/api/config').then(r => r.json()).then(cfg => ($('#mock').hidden = !cfg.mock));
