@@ -299,7 +299,8 @@ const routes = {
   'POST /api/taste': async ({ liked, disliked }) => tasteFrom(liked, disliked),
   'POST /api/reel': async ({ image, style, edits = [], prevId, line }) => {
     line = typeof line === 'string' ? line.trim().slice(0, 300) : '';
-    return ai.reel(image, style, edits, prevId, line || style?.line);
+    line ||= style?.line || LINES[style?.base] || LINES.theatrical; // older batches may predate lines
+    return { ...(await ai.reel(image, style, edits, prevId, line)), line };
   },
   'POST /api/music': async ({ image, style, edits = [] }) => ai.music(image, style, edits),
 };

@@ -217,7 +217,7 @@ $('#toReel').onclick = () => {
   actx.resume();
   S.edits = [];
   S.reelId = null;
-  S.line = $('#line').value = S.pick.style.line;
+  S.line = $('#line').value = S.pick.style.line ?? ''; // empty → server picks the type's line and echoes it back
   reel();
 };
 
@@ -251,6 +251,7 @@ async function reel() {
 
 function showVideo(v) {
   S.reelId = v.id;
+  S.line = $('#line').value = v.line || S.line; // the line actually performed
   const screen = $('.screen');
   screen.classList.remove('loading');
   if (v.src) {
