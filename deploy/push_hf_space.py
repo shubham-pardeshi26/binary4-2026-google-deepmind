@@ -21,7 +21,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 IGNORE = [".env", ".env.*", ".venv/**", "venv/**", "data/**", "**/__pycache__/**", "*.pyc",
-          ".git/**", ".DS_Store", "README.md"]
+          ".git/**", ".DS_Store", "README.md",
+          # local-only files: IDE config, stray photos at the repo root, internal pitch/notes
+          ".idea/**", "/*.jpg", "/*.jpeg", "/*.png", "PITCH.md", "HOW_IT_WORKS.md", "CLAUDE.md"]
 PASSTHROUGH_VARS = ("ADLOOP_MAX_CONCURRENT_RUNS", "ADLOOP_RUNS_PER_IP_PER_HOUR", "ADLOOP_SHOWCASE_RUN", "ADLOOP_MOCK")
 
 
