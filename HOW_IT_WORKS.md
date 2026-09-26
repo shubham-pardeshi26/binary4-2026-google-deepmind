@@ -2,7 +2,12 @@
 
 This follows **one ad run** through the code, from the moment someone clicks **Launch loop** to the finished, scored film and every edit afterwards. File and function names are given so you can jump straight to the code.
 
-> **Heads-up: the docs promise more than the code does.** `README.md` / `WRITEUP.md` (and CONTRACT §9) describe voiceover narration (Flash TTS), WebVTT captions, a narrated presentation, per-market narrated animatics, a `/voiceover` endpoint, and a Ken Burns fallback when Omni fails. **None of that is in the code.** The only trace is the `model_tts`/`tts_concurrency` settings in `app/config.py`. Everything below describes what actually runs. See [§12](#12-docs-vs-code-gaps) before you submit or pitch.
+> **Scope note.** This walkthrough was written against commit `15bb0de`. Commit `90690d7` then added:
+> - **Flash TTS voiceover:** per-scene narration forked right after the plan, the music ducked under it, WebVTT captions, `POST …/scenes/{sid}/voiceover`, a narrated presentation and localized animatics
+> - a **live Ken Burns fallback** when an Omni render fails
+> - a separate **posters** feature (`POSTERS_CONTRACT.md`)
+>
+> Those parts aren't covered below yet; everything else still applies.
 
 ---
 
@@ -35,8 +40,8 @@ Three ideas hold it together:
 **`static/app.js`, brief panel.** The user types a brief (or records one: MediaRecorder → `POST /api/transcribe` → `GenMedia.transcribe`, which fills the textarea). They set brand, aspect (16:9 / 9:16), scenes (3–6), variants per scene (2–6), an optional product photo, and markets, then click **Launch loop**. That sends a multipart `POST /api/runs`.
 
 **`app/main.py`, `create_run`.** It validates everything (brief length, aspect, ranges, the image sniffed as PNG/JPEG/WebP, ≤12MB), then applies two guards:
-- **concurrent-run cap** (`ADLOOP_MAX_CONCURRENT_RUNS`, default 3) → 429 "studio is busy"
-- **per-IP hourly limit** (`RateLimiter`, `ADLOOP_RUNS_PER_IP_PER_HOUR`) → 429
+- **concurrent-run cap** (`ADMATE_MAX_CONCURRENT_RUNS`, default 3) → 429 "studio is busy"
+- **per-IP hourly limit** (`RateLimiter`, `ADMATE_RUNS_PER_IP_PER_HOUR`) → 429
 
 It then calls `RunManager.create_run(...)` and returns `{"run_id"}` **immediately**. All real work happens in the background.
 
@@ -94,7 +99,7 @@ chains = [self.spawn(self._scene_chain(sid)) for each scene]       # one indepen
 1. **Prompt:** `prompts.scene_image_prompt(plan, scene)` builds the full NB2 prompt (scene prompt + brand bible + continuity rules + composition for the aspect ratio).
 2. **Fan-out, `_gen_variants`:** K NB2 calls run in parallel via `asyncio.gather`, each with a deterministic seed (`crc32(run:scene) + idx`). **Each variant is emitted the moment it lands**, as a `variant` event carrying its URL, latency and API path, which is why tiles pop in one by one. A failed variant emits `variant_error`; the others carry on.
 3. **Judge, `_judge` → `prompts.judge_scene`:** Flash vision gets all K images plus the anchor and scores each 0–10 on five axes: brief fit (25%), brand consistency (20%), composition (20%), continuity (15%) and artefact-free (20%). `normalize_judgement` recomputes the weighted overall score. The judge also returns `winner_index`, a rationale and `fix_instructions`. Scores are mapped back to global variant indices, then the `judge` event is emitted.
-4. **Self-repair:** if the best score is below `ADLOOP_JUDGE_THRESHOLD` (default 7.0) and there are repair rounds left (default 1), NB2 generates **2 edits of the winner** with the judge's fix instructions (base image first in refs). The judge then re-scores **winner vs repairs**. This is draft → verify → fix for images.
+4. **Self-repair:** if the best score is below `ADMATE_JUDGE_THRESHOLD` (default 7.0) and there are repair rounds left (default 1), NB2 generates **2 edits of the winner** with the judge's fix instructions (base image first in refs). The judge then re-scores **winner vs repairs**. This is draft → verify → fix for images.
 5. **`set_winner`** stores the winner, sets `winner_ready` and emits `winner` (`by: "judge"`).
 
 ---
@@ -104,7 +109,7 @@ chains = [self.spawn(self._scene_chain(sid)) for each scene]       # one indepen
 **`render_clip(scene_id, token, reason)`:**
 - **Queue:** it emits `clip_status: queued`, then takes the scene's `clip` lock, so renders and edits of *the same* clip run in order while different clips run in parallel.
 - **Stale check:** if `token != render_token`, a newer select/regenerate superseded this request and it's dropped.
-- **Render:** it reads the winning keyframe and builds `prompts.scene_motion_prompt` (camera move, physics, mood, "keep keyframe identity"), then calls `GenMedia.generate_video(prompt, image=keyframe, aspect, seconds)`. `seconds` is the planned duration, capped by `ADLOOP_VIDEO_SECONDS`.
+- **Render:** it reads the winning keyframe and builds `prompts.scene_motion_prompt` (camera move, physics, mood, "keep keyframe identity"), then calls `GenMedia.generate_video(prompt, image=keyframe, aspect, seconds)`. `seconds` is the planned duration, capped by `ADMATE_VIDEO_SECONDS`.
 - **Progress:** `_progress_cb` turns Omni's polling into throttled `clip_status: rendering, elapsed_ms` events, which drive the live timer on the clip card.
 - **Success:** it saves `s1_clip_v1.mp4` and adds a clip version storing **`interaction_id`**, which later edits need. It emits `clip`, then calls `request_stitch()`.
 - **Failure:** it emits the error. The clip is marked `error`, or stays `done` if an older version exists.
@@ -129,7 +134,7 @@ chains = [self.spawn(self._scene_chain(sid)) for each scene]       # one indepen
 - each clip is scaled/padded to 1280×720 (or 720×1280) at 30fps and trimmed to its exact probed duration
 - clips are joined with short crossfades
 - the music is trimmed or padded to the film's length, with a fade-out and loudness normalisation
-- clip audio is dropped unless `ADLOOP_KEEP_CLIP_AUDIO=1`
+- clip audio is dropped unless `ADMATE_KEEP_CLIP_AUDIO=1`
 - the file is written with faststart
 
 It then emits `final`. On the first cut it also sets `status: done` and emits **`run_done`**, whose `wall_ms` is the headline time-to-final.
@@ -199,19 +204,19 @@ Every modality is one async method returning a `GenResult(data, mime_type, laten
   - video: Interactions → `generate_videos`
   - music: Interactions
 
-  The first path that works is remembered per model. `ADLOOP_<ROLE>_PATH` pins it.
+  The first path that works is remembered per model. `ADMATE_<ROLE>_PATH` pins it.
 - **Shape ladder:** on 400/422 or an empty response, the same path is retried with progressively smaller requests (dropping `image_size`, `resolution`, `duration`, JSON schema, thinking config…). The working level is remembered.
 - **Backoff:** 429/5xx and transport errors are retried at 0.8 / 1.6 / 3.2s. **Safety refusals are final**, never retried.
-- **Concurrency caps:** a semaphore per modality (`ADLOOP_IMAGE_CONCURRENCY=8`, `VIDEO=4`, `TEXT=6`, `MUSIC=3`) and live in-flight counters, which feed the pulsing model chips.
+- **Concurrency caps:** a semaphore per modality (`ADMATE_IMAGE_CONCURRENCY=8`, `VIDEO=4`, `TEXT=6`, `MUSIC=3`) and live in-flight counters, which feed the pulsing model chips.
 - **Downloads:** URI-delivered media is fetched with the SDK Files API or an authenticated GET.
 - **UI-safe errors:** `"<model> via <path>: <reason>"`, with keys redacted.
-- **Mock mode** (`ADLOOP_MOCK=1` or no key): each method sleeps a realistic jittered time and returns synthetic assets from `app/mock.py`:
+- **Mock mode** (`ADMATE_MOCK=1` or no key): each method sleeps a realistic jittered time and returns synthetic assets from `app/mock.py`:
   - Pillow gradient keyframes with the scene title and variant number
   - Ken Burns MP4s via `media.ken_burns`
   - chord-progression WAVs for music
   - brief-keyed fake plans, judgements and edit plans
 
-  `ADLOOP_MOCK_SPEED` scales the delays. Because this lives inside the adapter, **the pipeline, API and UI are identical in both modes**.
+  `ADMATE_MOCK_SPEED` scales the delays. Because this lives inside the adapter, **the pipeline, API and UI are identical in both modes**.
 
 `scripts/smoke_test.py` probes each model through the adapter, or with `--raw` directly via the SDK. `scripts/bench_nb2.py` measures NB2 burst latency and throughput for the README numbers.
 
@@ -221,20 +226,6 @@ Every modality is one async method returning a `GenResult(data, mime_type, laten
 
 - **On disk:** everything for a run lives in `data/runs/<id>/`: `run.json`, `events.jsonl` and every asset (`anchor.png`, `s1_r0_v0.png`, `s1_clip_v2.mp4`, `music_v1.mp3`, `final_v3.mp4`, `loc_<market>_s1.png`…), served by `GET /media/{run_id}/{file}` (path-traversal safe).
 - **Restart:** on startup, `main.lifespan` → `RunManager.load_existing()` reloads every `run.json` plus its event history, so past runs can be browsed and replayed after a restart.
-- **Showcase:** `GET /api/showcase` returns `ADLOOP_SHOWCASE_RUN`, or the newest finished run, for the **Watch sample run** button.
+- **Showcase:** `GET /api/showcase` returns `ADMATE_SHOWCASE_RUN`, or the newest finished run, for the **Watch sample run** button.
 
 ---
-
-## 12. Docs vs code: gaps
-
-Before submitting, either implement these or remove them from `README.md` / `WRITEUP.md`. Judges may read the repo and run it.
-
-| Claimed in README/WRITEUP | Reality in code |
-|---|---|
-| Flash TTS voiceover per scene, narrator voice, "re-voice" | Not implemented: no `generate_speech`, no voiceover state or events, no route |
-| Narration on scene timecodes, music ducking, WebVTT captions | `media.stitch` takes clips + music only |
-| Slide-by-slide *narrated* presentation | Presentation mode exists, but has no voiceover |
-| Localized **narrated animatic MP4** per market | Localization = NB2 keyframes + a regional Lyria track only |
-| "A failed Omni render falls back to a Ken Burns move" | Only in **mock** mode. Live, a failed render leaves that scene out of the cut |
-| "Every method tries the Interactions API first" | Text and image try `generate_content` first |
-| Measured-performance table | Still has `[[placeholders]]`. Run `bench_nb2.py` and a live run to fill it |

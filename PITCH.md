@@ -1,6 +1,6 @@
 # AdLoop pitch script (3 minutes + Q&A)
 
-> **Rule for the whole pitch: only claim what the demo shows.** Voiceover narration, captions and narrated animatics are in the README but **not in the code** (see `HOW_IT_WORKS.md` §12). Don't mention them unless someone implements them first. Every number in `[brackets]` must come from your own live run's telemetry drawer or `scripts/bench_nb2.py`. Never guess numbers on stage.
+> **Rule for the whole pitch: only claim what the demo shows.** Every number in `[brackets]` must come from your own live run's telemetry drawer or `scripts/bench_nb2.py`. Never guess numbers on stage. Voiceover narration was added in commit `90690d7`: confirm your deployed run's final cut actually has narration before you mention it.
 
 ---
 
@@ -18,7 +18,7 @@
    - **Brand:** *Chai Charminar* · **16:9** · **4 scenes × 4 variants**
 3. **Check the badge:** the top bar must say **● LIVE**, not MOCK. If Google is unreachable, say so honestly and use Tab A's **Watch sample run** (a replay of a real run).
 4. **Screen:** telemetry drawer **closed** (open it once, on cue), browser zoom so the storyboard grid fits, sound on for the final cut.
-5. **Fallback order:** a live run → Tab A (finished) → **Watch sample run** replay → `ADLOOP_MOCK=1` (say "offline mode").
+5. **Fallback order:** a live run → Tab A (finished) → **Watch sample run** replay → `ADMATE_MOCK=1` (say "offline mode").
 
 ---
 
@@ -91,9 +91,9 @@
 | **Is this real or mocked?** | The LIVE badge comes from `/api/health`, and every tile shows which API path produced it. Mock mode exists for offline development and uses the same pipeline and UI. |
 | **How long and how much per ad?** | `[time to final]` for 4 scenes × 4 variants. That's about `[16 + repairs]` images, `[4]` Omni clips and `[1]` Lyria track. Quote costs only if you've calculated them. |
 | **Why is the music good for *this* ad?** | Lyria gets a timed prompt built from the scene plan (durations, moods, energy per scene) and re-scores when an edit changes a scene's mood. |
-| **Does it do voiceover / narration?** | *Honest answer:* "It's designed (the contract has a TTS stage per scene) and it's next on the roadmap; today the film is scored, not narrated." **Don't demo or claim it.** |
+| **Does it do voiceover / narration?** | Yes: Flash TTS voices one line per scene (hook → benefit → CTA), placed on each scene's timecode with the music ducked underneath, plus captions. *(Only say this if your demo run's final cut actually has narration.)* |
 | **How does it scale?** | State is event-sourced: every run is an append-only event log plus assets, which is also what powers replay. Today it's a single instance on local disk; scaling out means moving the log and assets to shared storage, not a rewrite. |
-| **What's next?** | Narration with Flash TTS, brand-kit memory across campaigns, export to ad platforms, and learning the judge rubric from user overrides. |
+| **What's next?** | Lip-synced talent, brand-kit memory across campaigns, export to ad platforms, and learning the judge rubric from user overrides. |
 
 ---
 

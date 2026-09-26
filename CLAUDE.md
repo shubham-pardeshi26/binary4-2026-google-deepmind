@@ -17,14 +17,14 @@ Check the branch before assuming which codebase you're in.
 python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env                                   # set GEMINI_API_KEY; every other var is optional and documented there
 .venv/bin/uvicorn app.main:app --port 8000 --reload    # live if a key is set
-ADLOOP_MOCK=1 .venv/bin/uvicorn app.main:app --port 8000   # fully offline, synthetic assets
+ADMATE_MOCK=1 .venv/bin/uvicorn app.main:app --port 8000   # fully offline, synthetic assets
 ```
 
 There is no pytest suite and no linter config. The test is the end-to-end mock-mode check, which drives the real HTTP API and SSE stream and asserts the contract:
 
 ```bash
 .venv/bin/python scripts/e2e_mock.py --inprocess --data-dir /tmp/adloop_e2e --mock-speed 0.3   # no TCP port needed
-.venv/bin/python scripts/e2e_mock.py --base http://localhost:8000 --skip-rate-limit          # against a running ADLOOP_MOCK=1 server
+.venv/bin/python scripts/e2e_mock.py --base http://localhost:8000 --skip-rate-limit          # against a running ADMATE_MOCK=1 server
 ```
 
 Live model checks (need a key and network):
@@ -45,7 +45,7 @@ ffmpeg comes from `PATH` if present, otherwise from the binary bundled with `ima
 - every SSE event type and its payload
 - the HTTP API
 
-The pipeline, the frontend and `scripts/e2e_mock.py` all depend on those keys. If you change a shape, update `CONTRACT.md` and every consumer together. Section 9 (the TTS voiceover addendum) is **specified but not implemented**: there is no speech generation, voiceover state, `/voiceover` route, captions or narrated presentation in the code, although `README.md` and `WRITEUP.md` describe them as if they exist. Only `config.py` defines `model_tts`/`tts_concurrency`. The file also assigns module ownership (A: models, B: orchestration, C: frontend, D: ship), which was used to split work between parallel builders.
+The pipeline, the frontend and `scripts/e2e_mock.py` all depend on those keys. If you change a shape, update `CONTRACT.md` and every consumer together. Section 9 (TTS voiceover: `GenMedia.generate_speech`, per-scene narration, ducking, WebVTT captions, `/voiceover` route) is implemented. `POSTERS_CONTRACT.md` specifies the separate posters feature (`app/posters.py`, `app/poster_prompts.py`, `static/posters.*`, `scripts/e2e_posters.py`). The file also assigns module ownership (A: models, B: orchestration, C: frontend, D: ship), which was used to split work between parallel builders.
 
 The layers, strictly one-directional:
 
@@ -54,25 +54,25 @@ The layers, strictly one-directional:
   - on HTTP 400 or an empty response, walks a "shape ladder" of progressively smaller requests (dropping optional fields); the level that worked is remembered too
   - retries 429/5xx with backoff (0.8/1.6/3.2s); safety refusals are final and never retried
   - video edits try: multi-turn (`previous_interaction_id`) → single-turn with the prior clip bytes → re-render from the keyframe
-  - **remembers which API path worked per model**; `ADLOOP_<ROLE>_PATH` pins it
+  - **remembers which API path worked per model**; `ADMATE_<ROLE>_PATH` pins it
   - caps concurrency with per-modality semaphores
 
   **Mock mode is handled inside `GenMedia`**, which returns synthetic assets built by `app/mock.py`. Everything above this layer is mode-agnostic, so never branch on mock mode in the pipeline.
 - **`app/prompts.py`**: the creative functions (`plan_campaign`, `judge_scene`, `plan_direction`, `interpret_clip_edit`, `localize_plan`, and the prompt builders). They call `GenMedia` and never touch the SDK directly.
 - **`app/pipeline.py`** (`Run`, `RunManager`): the scheduler.
-  - The plan immediately forks music v1 and the continuity anchor.
+  - The plan immediately forks music v1, per-scene TTS voiceovers and the continuity anchor.
   - Each scene then runs as an **independent chain with no global barrier**: NB2 variants → judge → optional repair round → Omni clip, submitted the moment that scene's winner exists.
   - Superseded work is dropped via per-scene `render_token`s.
   - The final cut is a debounced, single-flight stitch loop (`request_stitch`), re-run after any later change.
   - User actions (`action_*`) return immediately. Background work goes through `Run.spawn`, which turns exceptions into `error`/`log` events instead of crashing.
-  - The first cut waits only for every scene to *settle* (clip done or failed) and the music to settle, so a failed Omni render just leaves that scene out. Ken Burns clips are only produced in mock mode, despite the README.
+  - A failed Omni render falls back to a Ken Burns clip of the keyframe (`fallback="ken_burns"`), and a failed voiceover is cut without that line, so the film always completes.
 - **`app/events.py`**: event sourcing. Every state change is an event stamped with `t` and a monotonically increasing `seq`, appended to `data/runs/<id>/events.jsonl` and fanned out over SSE: full history first, then live. `?replay=1` re-paces a finished run. `main.py` reloads existing `run.json` files on startup.
-- **`app/media.py`**: ffmpeg helpers: Ken Burns (mock video), clip normalisation, crossfade stitch with the soundtrack fitted to the cut length.
+- **`app/media.py`**: ffmpeg helpers: Ken Burns, clip normalisation, crossfade stitch, narration placed per scene with the music ducked under it (sidechain, falling back to a fixed level), WebVTT captions. Thread counts are capped (`ADMATE_FFMPEG_THREADS`, default 2) because ffmpeg otherwise sizes itself to the host's cores and can get OOM-killed in containers.
 - **`app/main.py`**: FastAPI routes, per-IP rate limiting, concurrent-run cap, path-traversal-safe `/media/{run_id}/{file}`.
 - **`static/`**: vanilla ES-module UI, no build step. It rebuilds from `GET /api/runs/{id}`, then applies SSE events incrementally, deduplicating by `seq` (`ui.lastSeq`) so reconnects and replays never duplicate tiles. `#run=<id>` restores a run on refresh.
 
 ## Working notes
 
-- Mock mode (`ADLOOP_MOCK=1`, or no key) must keep **every** feature working offline. Outbound network to Google has been blocked on dev machines, so verify changes in mock mode (`e2e_mock.py --inprocess`). `ADLOOP_MOCK_SPEED` scales the simulated latencies.
+- Mock mode (`ADMATE_MOCK=1`, or no key) must keep **every** feature working offline. Outbound network to Google has been blocked on dev machines, so verify changes in mock mode (`e2e_mock.py --inprocess`). `ADMATE_MOCK_SPEED` scales the simulated latencies.
 - The repo is public. The API key lives only in the git-ignored `.env`; `.dockerignore` also keeps it out of images.
 - Run data and generated assets go to `data/` (git-ignored).
