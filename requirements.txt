@@ -1,0 +1,19 @@
+# AdLoop runtime dependencies.
+# Lower bounds = the versions the app was built and tested against (see .venv);
+# upper bounds = next major, so a fresh `pip install` cannot silently pick up a breaking release.
+
+# Web server + API
+fastapi>=0.141.1,<1.0
+uvicorn[standard]>=0.54.0,<1.0
+python-multipart>=0.0.32,<1.0      # multipart uploads (brief form, product photo, voice brief)
+
+# Google GenMedia SDK (Gemini Flash, Nano Banana 2 Lite, Omni Flash, Lyria via the Interactions API)
+google-genai>=2.25.0,<3.0
+
+# Media
+pillow>=12.3.0,<13.0               # mock-mode frames, image normalisation
+imageio-ffmpeg>=0.6.0,<1.0         # bundled ffmpeg fallback when no system ffmpeg is on PATH
+
+# Config / HTTP
+python-dotenv>=1.2.3,<2.0
+httpx>=0.28.1,<1.0                 # authenticated download of URI-delivered media
