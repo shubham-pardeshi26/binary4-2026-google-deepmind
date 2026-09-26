@@ -4,6 +4,8 @@
   Static markup only: every dynamic region is an empty, id'd container that
   static/app.js fills from the single run-state store (CONTRACT §8).
   No inline handlers; all behaviour is wired in app.js.
+  Web fonts are attached by app.js at boot (non-blocking), so an offline or
+  blackholed fonts.googleapis.com never delays first paint.
 -->
 <html lang="en">
 <head>
@@ -15,11 +17,12 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='.55' stop-color='%23ff4fd8'/%3E%3Cstop offset='1' stop-color='%23ffb547'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='16' cy='16' r='11' fill='none' stroke='url(%23g)' stroke-width='5'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" />
   <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/posters.css" />
   <script type="module" src="/static/app.js"></script>
+  <script type="module" src="/static/posters.js"></script>
 </head>
-<body>
+<body class="tele-closed">
   <div class="bg-aurora" aria-hidden="true"></div>
 
   <!-- ─────────────────────────── 1. Top bar ─────────────────────────── -->
@@ -35,6 +38,7 @@
       <span class="model-chip" id="chip-image" data-mod="image" role="listitem" title="Storyboard + localization keyframes"><i></i>Nano Banana 2 Lite</span>
       <span class="model-chip" id="chip-video" data-mod="video" role="listitem" title="Image-to-video + conversational editing"><i></i>Omni Flash</span>
       <span class="model-chip" id="chip-music" data-mod="music" role="listitem" title="Adaptive soundtrack"><i></i>Lyria 3.5</span>
+      <span class="model-chip minor" id="chip-tts" data-mod="tts" role="listitem" title="Gemini Flash TTS — scene-by-scene voiceover narration"><i></i>Flash TTS</span>
     </div>
 
     <div class="topbar-right">
@@ -43,14 +47,17 @@
         <button class="btn ghost sm" id="recent-btn" aria-haspopup="true" aria-expanded="false">Recent runs</button>
         <div class="recent-menu glass" id="recent-menu" hidden></div>
       </div>
-      <button class="btn grad sm" id="sample-btn">▶ Watch sample run</button>
-      <button class="btn ghost sm icon" id="telemetry-toggle" title="Toggle telemetry (T)" aria-controls="telemetry">≡ Telemetry</button>
+      <button class="btn grad sm" id="sample-btn">▶ <span class="lbl-long">Watch sample run</span><span class="lbl-short">Sample</span></button>
+      <button class="btn ghost sm tele-toggle" id="telemetry-toggle" title="Toggle telemetry (T)" aria-controls="telemetry" aria-expanded="false">
+        <span class="tele-activity" id="tele-activity" aria-hidden="true"></span><span class="lbl-long">Telemetry</span><span class="lbl-short">Stats</span>
+      </button>
     </div>
   </header>
 
   <div class="layout">
     <!-- ─────────────────────────── 2. Brief panel ─────────────────────────── -->
     <aside class="brief glass" id="brief-panel" aria-label="Creative brief">
+      <div class="brief-scroll">
       <div class="panel-head">
         <h2>Creative brief</h2>
         <span class="muted small">voice or text</span>
@@ -108,17 +115,22 @@
           </div>
         </div>
       </div>
-      <div class="fanout-hint mono muted" id="fanout-hint"></div>
 
       <div class="field">
         <span class="field-label">Markets <span class="muted">(localize after the cut)</span></span>
         <div class="chip-set" id="brief-markets"></div>
       </div>
+      </div>
 
-      <button class="launch-btn" id="launch-btn" type="button">
-        <span class="launch-glow" aria-hidden="true"></span>
-        <span class="launch-label">Launch loop</span><span class="kbd">⌘↵</span>
-      </button>
+      <!-- Sticky footer: the launch button is always visible, whatever the panel's scroll position. -->
+      <div class="brief-foot">
+        <div class="fanout-hint mono" id="fanout-hint"></div>
+        <button class="launch-btn" id="launch-btn" type="button">
+          <span class="launch-glow" aria-hidden="true"></span>
+          <span class="launch-spinner" aria-hidden="true"></span>
+          <span class="launch-label">Launch loop</span><span class="kbd">⌘↵</span>
+        </button>
+      </div>
     </aside>
 
     <!-- ─────────────────────────── Workspace ─────────────────────────── -->
@@ -128,15 +140,16 @@
         <div class="hero-eyebrow mono">GEMINI · NANO BANANA 2 LITE · OMNI FLASH · LYRIA 3.5</div>
         <h1 class="hero-title">One sentence in.<br /><span class="grad-text">A finished ad out.</span></h1>
         <p class="hero-sub">A creative director plans it, Nano Banana fans out the storyboard, a vision judge picks
-          winners and repairs the weak ones, Omni animates each keyframe the instant it wins, and Lyria scores it,
-          all pipelined and all live.</p>
+          winners and repairs the weak ones, Omni animates each keyframe the instant it wins, Lyria scores it and
+          Flash TTS narrates it, all pipelined and all live.</p>
         <div class="hero-steps">
           <div class="hero-step"><b>01</b><span>Director</span><small>Gemini Flash plan</small></div>
           <div class="hero-step"><b>02</b><span>Storyboard</span><small>N × K parallel keyframes</small></div>
           <div class="hero-step"><b>03</b><span>Judge</span><small>vision tournament + repair</small></div>
           <div class="hero-step"><b>04</b><span>Motion</span><small>Omni image-to-video</small></div>
           <div class="hero-step"><b>05</b><span>Score</span><small>adaptive Lyria soundtrack</small></div>
-          <div class="hero-step"><b>06</b><span>Final cut</span><small>stitched & presentable</small></div>
+          <div class="hero-step"><b>06</b><span>Voice</span><small>Flash TTS narration</small></div>
+          <div class="hero-step"><b>07</b><span>Final cut</span><small>narrated & presentable</small></div>
         </div>
         <div class="hero-cta">
           <button class="btn grad" id="hero-sample">▶ Watch sample run</button>
@@ -154,6 +167,18 @@
           </div>
           <ol class="rail-nodes" id="rail-nodes"></ol>
         </section>
+
+        <!-- Live waterfall: proves the pipeline is pipelined, not barriered -->
+        <section class="gantt glass" id="gantt" aria-label="Pipeline timeline">
+          <div class="gantt-head">
+            <span class="tl-label mono muted">LIVE TIMELINE · every scene runs its own chain</span>
+            <span class="gantt-legend mono" id="gantt-legend"></span>
+          </div>
+          <div class="gantt-body" id="gantt-body"></div>
+        </section>
+
+        <!-- One-shot celebration when the first final cut lands -->
+        <div class="cut-banner" id="cut-banner" hidden></div>
 
         <!-- 4. Creative plan card -->
         <section class="plan glass" id="plan-card" aria-label="Creative plan"></section>
@@ -182,6 +207,9 @@
           <!-- 9. Final cut -->
           <section class="panel glass pad" id="final-panel" aria-label="Final cut"></section>
         </div>
+
+        <!-- 10b. Campaign kit (posters plugin: static/posters.js fills it) -->
+        <section class="panel glass pad" id="posters-mount" aria-label="Campaign kit"></section>
 
         <!-- 11. Localize -->
         <section class="panel glass pad" id="localize-panel" aria-label="Localize"></section>
@@ -224,8 +252,11 @@
       <button class="btn ghost sm" id="present-prev" aria-label="Previous slide">←</button>
       <div class="present-dots" id="present-dots"></div>
       <button class="btn ghost sm" id="present-next" aria-label="Next slide">→</button>
+      <span class="present-count mono" id="present-count"></span>
+      <button class="btn ghost sm present-auto" id="present-auto" type="button" aria-pressed="true" title="Advance automatically when the narration ends (A)">Auto-play</button>
       <button class="btn ghost sm" id="present-close" aria-label="Exit presentation">Esc</button>
     </div>
+    <div class="present-progress" aria-hidden="true"><i id="present-progress"></i></div>
   </div>
 
   <div class="toasts" id="toasts" aria-live="polite"></div>

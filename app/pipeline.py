@@ -7,13 +7,20 @@ from disk on startup and is the single entry point used by the HTTP layer.
 Scheduling is *pipelined, never barriered*::
 
     director ──┬──> music v1 (Lyria) ─────────────────────────────────────────────┐
+               ├──> s1..sN narration (Flash TTS, one line per scene, parallel) ───────┤
                └──> anchor (NB2) ──┬──> s1: K variants ─> judge ─(repair)─> winner ─> Omni clip ─┤
                                    ├──> s2: K variants ─> judge ─(repair)─> winner ─> Omni clip ─┼─> final stitch
                                    └──> sN: ...                                                  ┘
 
 Each scene is an independent chain, so scene 1 may already be rendering video while scene 4 is still being
-judged. The final cut is produced as soon as every clip and the soundtrack have a version, and any later change
-(new clip version, new music version, winner override) triggers a debounced, single-flight re-stitch.
+judged. The final cut is produced as soon as every clip, the soundtrack and every narration line have settled
+(done *or* failed -- a failed model never blocks the cut), and any later change (new clip / music / voiceover
+version, winner override) triggers a debounced, single-flight re-stitch with the narration re-placed and
+WebVTT captions re-timed.
+
+Graceful degradation for live demos: a scene whose Omni render fails gets a Ken-Burns clip of its winning
+keyframe (``fallback="ken_burns"``), a failed soundtrack cuts with narration only, a failed line is cut without
+it, and every model call is bounded by a timeout so no background task can hang forever.
 
 Concurrency model
 -----------------
@@ -48,6 +55,7 @@ from typing import Any, Awaitable, Callable, Coroutine
 
 from app import media
 from app.events import EventBus
+from app.genai_client import GenResult
 
 log = logging.getLogger("adloop.pipeline")
 
@@ -64,6 +72,20 @@ PROGRESS_INTERVAL_S = 0.9
 REPAIR_VARIANTS = 2
 #: Maximum characters kept from any single user instruction.
 MAX_INSTRUCTION_CHARS = 600
+#: Maximum characters of one narration line (a 6s scene holds ~14 words).
+MAX_VOICEOVER_CHARS = 400
+#: Upper bounds on single model calls, on top of GenMedia's own per-attempt timeouts (whose fallback ladders can
+#: chain several attempts). They guarantee every background task settles, so the final cut can always happen.
+TEXT_TIMEOUT_S = 180.0
+IMAGE_TIMEOUT_S = 240.0
+MUSIC_TIMEOUT_S = 480.0
+TTS_TIMEOUT_S = 120.0
+#: Narrator used when a plan carries no (valid) voice.
+DEFAULT_VOICE = {"name": "Kore", "style": "warm, confident, upbeat narrator"}
+#: Longest an action waits for a scene's first winning keyframe before giving up on it.
+WINNER_WAIT_S = 600.0
+#: Parallel ffmpeg renders per run for localized animatics (CPU bound).
+ANIMATIC_CONCURRENCY = 3
 
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
@@ -142,6 +164,27 @@ def _percentile(values: list[int], pct: float) -> int | None:
     return int(ordered[k])
 
 
+async def _bounded(awaitable: Awaitable, seconds: float, what: str) -> Any:
+    """Await ``awaitable`` for at most ``seconds``; a timeout becomes a UI-readable RuntimeError."""
+    try:
+        return await asyncio.wait_for(awaitable, timeout=seconds)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"{what} timed out after {int(seconds)}s") from None
+
+
+def _voiceover_skeleton(text: str = "") -> dict:
+    """Initial per-scene narration state (CONTRACT §9c); ``v`` counts rendered versions (0 = none yet)."""
+    return {"status": "idle", "v": 0, "text": text, "url": None, "latency_ms": 0, "duration_s": None,
+            "error": None, "voice": None}
+
+
+def _line(value: Any) -> str:
+    """A narration line from a plan / direction / localize value (string, or a dict with ``text``)."""
+    if isinstance(value, dict):
+        value = value.get("text")
+    return " ".join(str(value or "").split())[:MAX_VOICEOVER_CHARS]
+
+
 def new_run_id() -> str:
     """8-char lowercase hex run id."""
     return secrets.token_hex(4)
@@ -165,9 +208,11 @@ class _SceneRuntime:
 
     board: asyncio.Lock = field(default_factory=asyncio.Lock)   # storyboard rounds
     clip: asyncio.Lock = field(default_factory=asyncio.Lock)    # Omni renders / edits
+    vo: asyncio.Lock = field(default_factory=asyncio.Lock)      # narration renders
     winner_ready: asyncio.Event = field(default_factory=asyncio.Event)
     next_idx: int = 0            # next global variant index to hand out
     render_token: int = 0        # bumped by select/regenerate; stale re-renders are skipped
+    vo_token: int = 0            # bumped by every re-voice request; superseded ones are skipped
 
 
 class Run:
@@ -198,6 +243,7 @@ class Run:
         # metrics throttling
         self._metrics_last = 0.0
         self._metrics_handle: asyncio.TimerHandle | None = None
+        self._animatic_sem = asyncio.Semaphore(ANIMATIC_CONCURRENCY)
         self._rebuild_runtime()
 
     # ------------------------------------------------------------------ properties
@@ -329,10 +375,23 @@ class Run:
             d = self.plan_scene(sc["id"])
             d["winner_url"] = self.winner_variant(sc)["url"] if self.winner_variant(sc) else None
             d["clip_versions"] = len(sc["clip"]["versions"])
+            d["voiceover"] = (sc.get("voiceover") or {}).get("text") or d.get("voiceover") or ""
             d["last_instruction"] = next((v.get("instruction") for v in reversed(sc["clip"]["versions"])
                                           if v.get("instruction")), None)
             out.append(d)
         return out
+
+    @property
+    def voice(self) -> dict:
+        """The plan's narrator ``{"name", "style"}`` (defaults filled in)."""
+        raw = (self.plan or {}).get("voice")
+        raw = raw if isinstance(raw, dict) else {}
+        return {"name": str(raw.get("name") or DEFAULT_VOICE["name"]),
+                "style": str(raw.get("style") or DEFAULT_VOICE["style"])}
+
+    def video_cap_s(self) -> float:
+        """Hard ceiling on one Omni call (its fallback ladder may chain several polled attempts)."""
+        return float(self.settings.video_timeout_seconds) * 1.5 + 60.0
 
     def clip_seconds(self, sc: dict) -> int:
         """Clip duration for a scene: the planned duration, capped by ``settings.video_seconds``."""
@@ -382,11 +441,12 @@ class Run:
         self.emit("stage", stage="director", status="start")
         self.touch_metrics()
         try:
-            plan_obj, res = await p.plan_campaign(
+            plan_obj, res = await _bounded(p.plan_campaign(
                 self.gm, brief=inp["brief"], brand=inp.get("brand", ""), aspect=self.aspect,
-                n_scenes=inp["n_scenes"], markets=inp.get("markets", []), product_image=self.product_image)
+                n_scenes=inp["n_scenes"], markets=inp.get("markets", []), product_image=self.product_image),
+                TEXT_TIMEOUT_S, "creative director")
         except Exception as exc:  # noqa: BLE001
-            self.fail("director", exc)
+            self.fail("director", f"the creative director could not write a plan: {_err_text(exc)}")
             self.state["status"] = "error"
             self.save()
             return
@@ -402,8 +462,10 @@ class Run:
                   detail=f"{len(plan['scenes'])} scenes · {res.api_path}")
         self.save()
 
-        # ---- 2. fork: music v1 (never waits for images) || anchor -> scene chains
+        # ---- 2. fork: music v1 + per-scene narration (never wait for images) || anchor -> scene chains
         self.spawn(self.render_music(reason="initial"), stage="music")
+        for sc in self.state["scenes"]:
+            self.spawn(self.render_voiceover(sc["id"], reason="initial"), stage="voice", scene_id=sc["id"])
         await self._make_anchor()
         chains = [self.spawn(self._scene_chain(sc["id"]), stage="storyboard", scene_id=sc["id"])
                   for sc in self.state["scenes"]]
@@ -433,6 +495,7 @@ class Run:
                 "duration_s": sc.get("duration_s") or self.settings.video_seconds,
                 "variants": [], "judge": [], "winner": None,
                 "clip": {"status": "idle", "elapsed_ms": 0, "error": None, "current": 0, "versions": []},
+                "voiceover": _voiceover_skeleton(_line(sc.get("voiceover"))),
             })
         self._rebuild_runtime()
 
@@ -454,8 +517,9 @@ class Run:
                       f"no text.").strip()
         started = self.bus.now_ms()
         try:
-            res = await self.gm.generate_image(prompt, refs=[self.product_image] if self.product_image else [],
-                                               aspect=self.aspect)
+            refs = [self.product_image] if self.product_image else []
+            res = await _bounded(self.gm.generate_image(prompt, refs=refs, aspect=self.aspect),
+                                 IMAGE_TIMEOUT_S, "anchor image")
         except Exception as exc:  # noqa: BLE001
             self.fail("anchor", exc)
             self.log("warn", "continuing without a continuity anchor")
@@ -489,8 +553,9 @@ class Run:
         async def one(idx: int) -> dict | None:
             started = self.bus.now_ms()
             try:
-                res = await self.gm.generate_image(prompt, refs=refs, aspect=self.aspect,
-                                                   seed=(seed_base + idx) % (2 ** 31))
+                res = await _bounded(self.gm.generate_image(prompt, refs=refs, aspect=self.aspect,
+                                                            seed=(seed_base + idx) % (2 ** 31)),
+                                     IMAGE_TIMEOUT_S, "storyboard image")
                 if not res.data:
                     raise RuntimeError("image model returned no image")
             except Exception as exc:  # noqa: BLE001
@@ -530,9 +595,9 @@ class Run:
         self.emit("stage", stage="judge", status="start", scene_id=scene_id)
         self.touch_metrics()
         try:
-            judgement_obj, res = await p.judge_scene(
+            judgement_obj, res = await _bounded(p.judge_scene(
                 self.gm, plan=self.plan, scene=self.plan_scene(scene_id), variants=[b for _, b in pairs],
-                anchor=await self.anchor_bytes())
+                anchor=await self.anchor_bytes()), TEXT_TIMEOUT_S, "vision judge")
         except Exception as exc:  # noqa: BLE001
             self.fail("judge", exc, scene_id=scene_id)
             return None
@@ -717,12 +782,17 @@ class Run:
             self._set_clip_status(scene_id, "rendering", elapsed_ms=0)
             self.touch_metrics()
             try:
-                res = await self.gm.generate_video(prompt, image=image, aspect=self.aspect,
-                                                   seconds=self.clip_seconds(sc),
-                                                   on_progress=self._progress_cb(scene_id))
+                res = await _bounded(self.gm.generate_video(prompt, image=image, aspect=self.aspect,
+                                                            seconds=self.clip_seconds(sc),
+                                                            on_progress=self._progress_cb(scene_id)),
+                                     self.video_cap_s(), "video render")
                 if not res.data:
                     raise RuntimeError("video model returned no video")
             except Exception as exc:  # noqa: BLE001
+                kind = "initial" if reason == "initial" else "rerender"
+                if await self._fallback_clip(scene_id, image, error=_err_text(exc), instruction=instruction,
+                                             kind=kind):
+                    return
                 msg = self.fail("motion", exc, scene_id=scene_id)
                 # Keep showing the previous version if there is one.
                 self._set_clip_status(scene_id, "done" if sc["clip"]["versions"] else "error", error=msg)
@@ -733,6 +803,33 @@ class Run:
             self._add_clip_version(scene_id, res, url, instruction=instruction,
                                    kind="initial" if reason == "initial" else "rerender")
             self.emit("stage", stage="motion", status="done", scene_id=scene_id, ms=res.latency_ms)
+
+    async def _fallback_clip(self, scene_id: str, image: bytes | None, *, error: str, instruction: str | None,
+                             kind: str) -> bool:
+        """Omni failed: animate the winning keyframe with a Ken-Burns push-in so the cut still happens.
+
+        The version is marked ``api_path="fallback"`` / ``fallback="ken_burns"`` so the UI can label it, and a
+        ``warn`` log explains why. Returns False (caller reports the original error) if even ffmpeg fails.
+        """
+        if image is None:
+            return False
+        sc = self.scene(scene_id)
+        t0 = time.perf_counter()
+        try:
+            data = await media.ken_burns(image, self.clip_seconds(sc), self.aspect)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("run %s: ken burns fallback for %s failed: %s", self.id, scene_id, exc)
+            return False
+        res = GenResult(data=data, mime_type="video/mp4", latency_ms=int((time.perf_counter() - t0) * 1000),
+                        model="ffmpeg", api_path="fallback", meta={"fallback": "ken_burns"})
+        self.log("warn", f"{scene_id}: video model failed ({error}) — using a Ken Burns clip of the winning "
+                         f"keyframe instead")
+        v_next = max([x["v"] for x in sc["clip"]["versions"]] + [0]) + 1
+        url = await self.save_asset(f"{scene_id}_clip_v{v_next}.mp4", data)
+        self._add_clip_version(scene_id, res, url, instruction=instruction, kind=kind)
+        self.emit("stage", stage="motion", status="done", scene_id=scene_id, ms=res.latency_ms,
+                  detail="fallback: ken burns")
+        return True
 
     async def edit_clip(self, scene_id: str, instruction: str, *, interpret: bool = True,
                         kind: str = "edit") -> None:
@@ -746,7 +843,7 @@ class Run:
         self.touch_metrics()
         # An edit issued before the first keyframe exists waits for the judge (bounded).
         try:
-            await asyncio.wait_for(rt.winner_ready.wait(), timeout=600)
+            await asyncio.wait_for(rt.winner_ready.wait(), timeout=WINNER_WAIT_S)
         except asyncio.TimeoutError:
             self._set_clip_status(scene_id, "error", error="no keyframe to edit")
             return
@@ -755,8 +852,10 @@ class Run:
             if not interpret:
                 return None
             try:
-                out, _ = await p.interpret_clip_edit(self.gm, plan=self.plan, scene=self.plan_scene(scene_id),
-                                                     instruction=instruction)
+                out, _ = await _bounded(p.interpret_clip_edit(self.gm, plan=self.plan,
+                                                              scene=self.plan_scene(scene_id),
+                                                              instruction=instruction),
+                                        TEXT_TIMEOUT_S, "edit interpretation")
                 return _to_dict(out)
             except Exception as exc:  # noqa: BLE001 - interpretation is advisory
                 self.log("warn", f"{scene_id}: edit interpretation failed ({_err_text(exc)})")
@@ -777,13 +876,18 @@ class Run:
                 "on_progress": self._progress_cb(scene_id),
                 "base_prompt": p.scene_motion_prompt(self.plan, self.plan_scene(scene_id)),
             })
-            edit = asyncio.ensure_future(self.gm.edit_video(instruction, **kwargs))
+            edit = asyncio.ensure_future(_bounded(self.gm.edit_video(instruction, **kwargs),
+                                                  self.video_cap_s(), "video edit"))
             interp = asyncio.ensure_future(interpret_task())
             try:
                 res = await edit
                 if not res.data:
                     raise RuntimeError("video model returned no video")
             except Exception as exc:  # noqa: BLE001
+                if not sc["clip"]["versions"] and image is not None and await self._fallback_clip(
+                        scene_id, image, error=_err_text(exc), instruction=instruction, kind=kind):
+                    interp.cancel()
+                    return
                 msg = self.fail("motion", exc, scene_id=scene_id)
                 self._set_clip_status(scene_id, "done" if sc["clip"]["versions"] else "error", error=msg)
                 interp.cancel()
@@ -836,7 +940,8 @@ class Run:
             try:
                 prompt = p.music_prompt(self.plan, self.scenes_for_prompts(), total_seconds=total,
                                         reason=None if reason == "initial" else reason, instruction=instruction)
-                res = await self.gm.generate_music(prompt, seconds=total)
+                res = await _bounded(self.gm.generate_music(prompt, seconds=total), MUSIC_TIMEOUT_S,
+                                     "soundtrack")
                 if not res.data:
                     raise RuntimeError("music model returned no audio")
             except Exception as exc:  # noqa: BLE001
@@ -844,6 +949,8 @@ class Run:
                 mus["status"] = "done" if mus["versions"] else "error"
                 mus["error"] = msg
                 self.emit("music_status", status="error", reason=reason, error=msg)
+                if not mus["versions"]:
+                    self.log("warn", "no soundtrack — the final cut will carry the narration only")
                 self.save()
                 self.touch_metrics()
                 self.request_stitch()  # a missing soundtrack must not block the first cut
@@ -860,6 +967,83 @@ class Run:
             self.touch_metrics()
             self.request_stitch()
 
+    # ================================================================== narration
+    async def render_voiceover(self, scene_id: str, *, reason: str, text: str | None = None,
+                               voice: str | None = None) -> None:
+        """Flash TTS for one scene's narration line (initial, user re-voice, or direction).
+
+        ``text`` / ``voice`` (optional) replace the scene's line / narrator first. Requests for the same scene are
+        coalesced (only the newest pending one renders). A failure never blocks the cut: the previous take (if
+        any) is kept, otherwise the scene is cut without narration.
+        """
+        sc = self.scene(scene_id)
+        if sc is None:
+            return
+        vo = sc.setdefault("voiceover", _voiceover_skeleton(_line(self.plan_scene(scene_id).get("voiceover"))))
+        rt = self._scenes[scene_id]
+        rt.vo_token += 1
+        token = rt.vo_token
+        async with rt.vo:
+            if token != rt.vo_token:
+                return  # superseded by a newer re-voice
+            line = _line(text) if text is not None else _line(vo.get("text"))
+            if voice:
+                vo["voice"] = str(voice)[:40]
+            if not line:
+                vo.update({"status": "idle", "text": "", "error": None})
+                self.save()
+                self.request_stitch()
+                return
+            prev_text = vo.get("text")
+            vo.update({"status": "rendering", "text": line, "error": None})
+            self.emit("voiceover_status", scene_id=scene_id, status="rendering")
+            self.emit("stage", stage="voice", status="start", scene_id=scene_id, detail=reason)
+            self.save()
+            self.touch_metrics()
+            try:
+                speak = getattr(self.gm, "generate_speech", None)
+                if speak is None:
+                    raise RuntimeError("text-to-speech is not available in this build")
+                res = await _bounded(speak(line, voice=vo.get("voice") or self.voice["name"],
+                                           style=self.voice["style"]), TTS_TIMEOUT_S, "narration")
+                if not res.data:
+                    raise RuntimeError("speech model returned no audio")
+            except Exception as exc:  # noqa: BLE001 - narration is optional for the cut
+                msg = _err_text(exc)
+                if vo.get("url"):  # keep the previous take, and the words that match it
+                    vo.update({"status": "done", "text": prev_text, "error": msg})
+                else:
+                    vo.update({"status": "error", "error": msg})
+                self.emit("voiceover_status", scene_id=scene_id, status="error", error=msg)
+                self.emit("stage", stage="voice", status="error", scene_id=scene_id, detail=msg)
+                self.log("warn", f"{scene_id} narration failed ({msg}); cutting without it")
+                self.save()
+                self.touch_metrics()
+                self.request_stitch()
+                return
+            v = int(vo.get("v") or 0) + 1
+            url = await self.save_asset(f"{scene_id}_vo_v{v}{media.ext_for_mime(res.mime_type)}", res.data)
+            duration = await self._audio_seconds(url)
+            vo.update({"status": "done", "v": v, "url": url, "latency_ms": res.latency_ms,
+                       "duration_s": duration, "error": None})
+            self.state["metrics"].setdefault("_tts_lat", []).append(int(res.latency_ms))
+            self.emit("voiceover", scene_id=scene_id, v=v, text=line, url=url, latency_ms=res.latency_ms,
+                      duration_s=duration)
+            self.emit("voiceover_status", scene_id=scene_id, status="done")
+            self.emit("stage", stage="voice", status="done", scene_id=scene_id, ms=res.latency_ms,
+                      detail=f"{duration or 0:.1f}s")
+            self.save()
+            self.touch_metrics()
+            self.request_stitch()
+
+    async def _audio_seconds(self, url: str) -> float | None:
+        """Probed duration of an audio asset of this run (None if it cannot be read)."""
+        path = self.path_for_url(url)
+        try:
+            return round(await media.probe_duration(path), 2) if path else None
+        except Exception:  # noqa: BLE001 - a missing duration only affects placement precision
+            return None
+
     # ================================================================== final cut
     def _stitch_ready(self) -> bool:
         """First-cut readiness: every scene settled (clip done or failed), >= 1 clip, music settled."""
@@ -875,7 +1059,9 @@ class Run:
                 return False
         mus = self.state["music"]
         music_settled = bool(mus.get("current")) or mus["status"] == "error"
-        return have_clip and music_settled
+        voices_settled = all((sc.get("voiceover") or {}).get("status") in ("done", "error")
+                             or not (sc.get("voiceover") or {}).get("text") for sc in scenes)
+        return have_clip and music_settled and voices_settled
 
     def request_stitch(self, *, force: bool = False) -> None:
         """Schedule a (debounced, single-flight) re-stitch. Cheap and safe to call from anywhere."""
@@ -906,10 +1092,19 @@ class Run:
     async def _stitch_once(self) -> None:
         clips: list[Path] = []
         missing: list[str] = []
+        voiceovers: list[tuple[Path | None, float]] = []
+        lines: list[str] = []
         for sc in self.state["scenes"]:
             cur = self.current_clip(sc)
             path = self.path_for_url(cur["url"]) if cur else None
-            (clips.append(path) if path else missing.append(sc["id"]))
+            if not path:
+                missing.append(sc["id"])
+                continue
+            clips.append(path)
+            vo = sc.get("voiceover") or {}
+            vo_path = self.path_for_url(vo.get("url"))
+            voiceovers.append((vo_path, float(vo.get("duration_s") or 0.0)))
+            lines.append((vo.get("text") or "") if vo_path else "")
         if not clips:
             self.log("warn", "final cut skipped: no clips rendered yet")
             return
@@ -926,8 +1121,11 @@ class Run:
         t0 = time.perf_counter()
         version = int(fin.get("version") or 0) + 1
         out = self.dir / f"final_v{version}.mp4"
+        narrated = sum(1 for p_, _ in voiceovers if p_)
+        captions = self.dir / f"captions_v{version}.vtt" if narrated else None
         try:
-            duration = await media.stitch(clips, music_path, out, aspect=self.aspect)
+            duration = await media.stitch(clips, music_path, out, aspect=self.aspect, voiceovers=voiceovers,
+                                          captions=lines, captions_out=captions)
         except Exception as exc:  # noqa: BLE001
             msg = self.fail("final", exc)
             fin["status"] = "done" if fin.get("url") else "error"
@@ -936,13 +1134,15 @@ class Run:
             return
         ms = int((time.perf_counter() - t0) * 1000)
         fin.update({"status": "done", "url": self.url(out.name), "duration_s": round(duration, 2),
-                    "version": version})
+                    "version": version, "captions_url": self.url(captions.name) if captions else None})
         first = self.state["metrics"].get("time_to_final_ms") is None
         if first:
             self.state["metrics"]["time_to_final_ms"] = self.bus.now_ms()
-        self.emit("final", url=fin["url"], duration_s=fin["duration_s"], version=version)
+        self.emit("final", url=fin["url"], duration_s=fin["duration_s"], version=version,
+                  captions_url=fin["captions_url"])
         self.emit("final_status", status="done")
-        self.emit("stage", stage="final", status="done", ms=ms, detail=f"v{version} · {duration:.1f}s")
+        self.emit("stage", stage="final", status="done", ms=ms,
+                  detail=f"v{version} · {duration:.1f}s · {narrated} narrated scene(s)")
         if first and self.state["status"] == "running":
             self.state["status"] = "done"
             self.emit("run_done", wall_ms=self.bus.now_ms())
@@ -975,6 +1175,11 @@ class Run:
     def action_edit(self, scene_id: str, instruction: str) -> None:
         self.spawn(self.edit_clip(scene_id, instruction), stage="motion", scene_id=scene_id)
 
+    def action_voiceover(self, scene_id: str, text: str | None, voice: str | None) -> None:
+        """Re-voice one scene (optionally with new words and/or a different narrator) -> re-stitch."""
+        self.spawn(self.render_voiceover(scene_id, reason="re-voice", text=text, voice=voice),
+                   stage="voice", scene_id=scene_id)
+
     def action_music(self, instruction: str | None) -> None:
         reason = f"re-score: {instruction}" if instruction else "re-score"
         self.spawn(self.render_music(reason=reason[:80], instruction=instruction), stage="music")
@@ -996,8 +1201,10 @@ class Run:
         self.emit("stage", stage="direct", status="start", detail=instruction)
         self.touch_metrics()
         t0 = time.perf_counter()
-        dplan_obj, res = await p.plan_direction(self.gm, plan=self.plan, scenes_state=self.scenes_for_prompts(),
-                                                instruction=instruction)
+        dplan_obj, res = await _bounded(p.plan_direction(self.gm, plan=self.plan,
+                                                         scenes_state=self.scenes_for_prompts(),
+                                                         instruction=instruction),
+                                        TEXT_TIMEOUT_S, "direction planner")
         dplan = _to_dict(dplan_obj)
         summary = str(dplan.get("summary") or instruction)
         self.state["directions"].append({"instruction": instruction, "summary": summary, "ts": time.time()})
@@ -1023,6 +1230,16 @@ class Run:
         if music_cfg.get("rescore", True):
             jobs.append(self.render_music(reason=f"direction: {instruction}"[:80],
                                           instruction=_clip_instruction(music_cfg.get("instruction")) or instruction))
+        # Narration: a new delivery style applies to the whole ad; listed lines are re-voiced in parallel.
+        style = _line(dplan.get("voice_style"))[:120]
+        if style and isinstance(self.plan, dict):
+            self.plan["voice"] = {**self.voice, "style": style}
+        for vu in dplan.get("voiceover_updates", []) or []:
+            vu = _to_dict(vu)
+            sid = str(vu.get("scene_id"))
+            if self.scene(sid):
+                jobs.append(self.render_voiceover(sid, reason=f"direction: {instruction}"[:80],
+                                                  text=_line(vu.get("text")) or None))
         results = await asyncio.gather(*jobs, return_exceptions=True)
         for r in results:
             if isinstance(r, Exception):
@@ -1035,7 +1252,11 @@ class Run:
         """Direction with ``restyle_keyframes``: NB2 edit of the winner -> new winner -> fresh Omni render."""
         p = _prompts()
         rt = self._scenes[scene_id]
-        await rt.winner_ready.wait()
+        try:
+            await asyncio.wait_for(rt.winner_ready.wait(), timeout=WINNER_WAIT_S)
+        except asyncio.TimeoutError:
+            self._set_clip_status(scene_id, "error", error="no keyframe to restyle")
+            return
         rt.render_token += 1
         token = rt.render_token
         async with rt.board:
@@ -1061,13 +1282,16 @@ class Run:
         p = _prompts()
         locs = self.state["localizations"]
         entry = locs.setdefault(market, {"status": "", "plan": {}, "scenes": [], "music_url": None})
-        entry.update({"status": "rendering", "scenes": [], "music_url": None, "error": None})
+        rev = int(entry.get("rev") or 0) + 1  # versioned file names: media URLs are cached aggressively
+        entry.update({"status": "rendering", "scenes": [], "music_url": None, "error": None, "rev": rev,
+                      "voiceover": [], "video_url": None, "captions_url": None})
         self.emit("localize_status", market=market, status="rendering")
         self.emit("stage", stage="localize", status="start", detail=market, market=market)
         self.save()
         t0 = time.perf_counter()
         try:
-            lplan_obj, _ = await p.localize_plan(self.gm, plan=self.plan, market=market)
+            lplan_obj, _ = await _bounded(p.localize_plan(self.gm, plan=self.plan, market=market),
+                                          TEXT_TIMEOUT_S, "localization planner")
         except Exception as exc:  # noqa: BLE001
             msg = self.fail("localize", exc, market=market)
             entry.update({"status": "error", "error": msg})
@@ -1080,7 +1304,10 @@ class Run:
         self.save()
         edits = {str(_to_dict(e).get("scene_id")): _to_dict(e).get("nb2_instruction")
                  for e in lplan.get("scene_edits", []) or []}
-        slug = _slug(market)
+        vo_lines = {str(_to_dict(e).get("scene_id")): _line(e) for e in lplan.get("voiceover", []) or []}
+        slug = f"{_slug(market)}_r{rev}"
+        keyframes: dict[str, bytes] = {}
+        voice_paths: dict[str, tuple[Path, float]] = {}
 
         async def scene_image(sc: dict) -> None:
             var = self.winner_variant(sc)
@@ -1093,11 +1320,13 @@ class Run:
             prompt = p.scene_image_prompt(self.plan, self.plan_scene(sc["id"]), instruction=instr)
             started = self.bus.now_ms()
             try:
-                res = await self.gm.generate_image(prompt, refs=self.refs(base), aspect=self.aspect)
+                res = await _bounded(self.gm.generate_image(prompt, refs=self.refs(base), aspect=self.aspect),
+                                     IMAGE_TIMEOUT_S, "localized image")
             except Exception as exc:  # noqa: BLE001
                 self.log("warn", f"localize {market} {sc['id']} failed: {_err_text(exc)}")
                 return
             url = await self.save_asset(f"loc_{slug}_{sc['id']}{media.ext_for_mime(res.mime_type)}", res.data)
+            keyframes[sc["id"]] = res.data
             entry["scenes"].append({"scene_id": sc["id"], "url": url, "latency_ms": res.latency_ms})
             entry["scenes"].sort(key=lambda s: [x["id"] for x in self.state["scenes"]].index(s["scene_id"]))
             self._image_landed(started)
@@ -1111,7 +1340,8 @@ class Run:
                 prompt = p.music_prompt(self.plan, self.scenes_for_prompts(), total_seconds=total,
                                         reason=f"localized for {market}",
                                         instruction=lplan.get("music_style") or None)
-                res = await self.gm.generate_music(prompt, seconds=total)
+                res = await _bounded(self.gm.generate_music(prompt, seconds=total), MUSIC_TIMEOUT_S,
+                                     "regional soundtrack")
             except Exception as exc:  # noqa: BLE001
                 self.log("warn", f"localize {market} music failed: {_err_text(exc)}")
                 return
@@ -1121,8 +1351,40 @@ class Run:
             self.save()
             self.touch_metrics()
 
+        async def scene_voice(sc: dict) -> None:
+            text = vo_lines.get(sc["id"])
+            speak = getattr(self.gm, "generate_speech", None)
+            if not text or speak is None:
+                return
+            voice = str(lplan.get("voice") or (sc.get("voiceover") or {}).get("voice") or self.voice["name"])
+            try:
+                res = await _bounded(speak(text, voice=voice, style=self.voice["style"],
+                                           language=lplan.get("language") or None), TTS_TIMEOUT_S,
+                                     "localized narration")
+                if not res.data:
+                    raise RuntimeError("speech model returned no audio")
+            except Exception as exc:  # noqa: BLE001
+                self.log("warn", f"localize {market} {sc['id']} narration failed: {_err_text(exc)}")
+                return
+            url = await self.save_asset(f"loc_{slug}_{sc['id']}_vo{media.ext_for_mime(res.mime_type)}", res.data)
+            duration = await self._audio_seconds(url) or 0.0
+            voice_paths[sc["id"]] = (self.path_for_url(url), duration)
+            self.state["metrics"].setdefault("_tts_lat", []).append(int(res.latency_ms))
+            entry["voiceover"].append({"scene_id": sc["id"], "url": url, "text": text})
+            entry["voiceover"].sort(key=lambda s: [x["id"] for x in self.state["scenes"]].index(s["scene_id"]))
+            self.emit("localize_voiceover", market=market, scene_id=sc["id"], url=url, text=text,
+                      latency_ms=res.latency_ms)
+            self.save()
+            self.touch_metrics()
+
         self.touch_metrics()
-        await asyncio.gather(*(scene_image(sc) for sc in self.state["scenes"]), regional_music())
+        await asyncio.gather(*(scene_image(sc) for sc in self.state["scenes"]),
+                             *(scene_voice(sc) for sc in self.state["scenes"]), regional_music())
+        if entry["scenes"]:
+            try:
+                await self._localized_animatic(market, entry, slug, keyframes, voice_paths)
+            except Exception as exc:  # noqa: BLE001 - the key visuals are still delivered
+                self.log("warn", f"localize {market} animatic failed: {_err_text(exc)}")
         ok = bool(entry["scenes"])
         entry["status"] = "done" if ok else "error"
         if not ok:
@@ -1131,6 +1393,35 @@ class Run:
                                                                               {"error": entry["error"]}))
         self.emit("stage", stage="localize", status="done" if ok else "error", detail=market, market=market,
                   ms=int((time.perf_counter() - t0) * 1000))
+        self.save()
+
+    async def _localized_animatic(self, market: str, entry: dict, slug: str, keyframes: dict[str, bytes],
+                                  voice_paths: dict[str, tuple[Path, float]]) -> None:
+        """Localized film: Ken-Burns of each localized keyframe (winner as fallback) + regional music + narration.
+
+        Emits ``localize_video`` and records ``video_url`` / ``captions_url`` on the market's state entry.
+        """
+        scenes = [sc for sc in self.state["scenes"] if sc["id"] in keyframes or self.winner_variant(sc)]
+
+        async def clip(sc: dict) -> Path:
+            image = keyframes.get(sc["id"]) or await self.read_url(self.winner_variant(sc)["url"])
+            async with self._animatic_sem:
+                data = await media.ken_burns(image, self.clip_seconds(sc), self.aspect)
+            return await asyncio.to_thread(media.save_bytes, self.dir, f"loc_{slug}_{sc['id']}_kb.mp4", data)
+
+        t0 = time.perf_counter()
+        clips = await asyncio.gather(*(clip(sc) for sc in scenes))
+        voices = [voice_paths.get(sc["id"], (None, 0.0)) for sc in scenes]
+        texts = {v["scene_id"]: v["text"] for v in entry.get("voiceover", [])}
+        out = self.dir / f"loc_{slug}_film.mp4"
+        captions = self.dir / f"loc_{slug}_captions.vtt" if any(p_ for p_, _ in voices) else None
+        duration = await media.stitch(list(clips), self.path_for_url(entry.get("music_url")), out,
+                                      aspect=self.aspect, voiceovers=voices,
+                                      captions=[texts.get(sc["id"], "") for sc in scenes], captions_out=captions)
+        entry["video_url"] = self.url(out.name)
+        entry["captions_url"] = self.url(captions.name) if captions else None
+        self.emit("localize_video", market=market, url=entry["video_url"], duration_s=round(duration, 2),
+                  captions_url=entry["captions_url"], latency_ms=int((time.perf_counter() - t0) * 1000))
         self.save()
 
     # ================================================================== metrics
@@ -1167,6 +1458,7 @@ class Run:
         for loc in st["localizations"].values():
             img_lat += [s["latency_ms"] for s in loc.get("scenes", [])]
         vids = [v for sc in st["scenes"] for v in sc["clip"]["versions"]]
+        tts_lat = m.get("_tts_lat", [])
         vid_lat = [v["latency_ms"] for v in vids]
         wall = self.bus.now_ms() if st["status"] == "running" else (m.get("time_to_final_ms") or m.get("wall_ms")
                                                                      or self.bus.now_ms())
@@ -1193,7 +1485,9 @@ class Run:
             "video_p50_ms": int(statistics.median(vid_lat)) if vid_lat else None,
             "video_edits": sum(1 for v in vids if v.get("kind") in ("edit", "direct")),
             "music_versions": len(st["music"]["versions"]),
-            "inflight": {k: int((inflight or {}).get(k, 0)) for k in ("image", "video", "music", "text")},
+            "voiceovers_generated": len(tts_lat),
+            "tts_p50_ms": _percentile(tts_lat, 50),
+            "inflight": {k: int((inflight or {}).get(k, 0)) for k in ("image", "video", "music", "text", "tts")},
             "time_to_first_image_ms": m.get("time_to_first_image_ms"),
             "time_to_first_clip_ms": m.get("time_to_first_clip_ms"),
             "time_to_final_ms": m.get("time_to_final_ms"),
@@ -1279,6 +1573,9 @@ class RunManager:
             if clip.get("status") in ("queued", "rendering"):
                 clip["status"] = "done" if clip.get("current") else "error"
                 clip["error"] = None if clip.get("current") else note
+            vo = sc.setdefault("voiceover", _voiceover_skeleton())
+            if vo.get("status") == "rendering":
+                vo["status"] = "done" if vo.get("url") else "error"
         for key in ("music", "final"):
             blk = state.get(key) or {}
             if blk.get("status") == "rendering":

@@ -11,9 +11,15 @@ action -- and asserts the CONTRACT (§6 run state + events, §7 endpoints) holds
   versions, music, final, localizations, metrics).
 * **Media**: every URL in the state returns 200 with the right content-type; Range requests return 206;
   path traversal is refused; the final MP4's duration matches the clips it was cut from (ffmpeg parse).
-* **Actions**: edit (clip v2 + adaptive re-score + re-stitch), direct (fan-out edits + music + re-stitch),
-  music, select (re-render), regenerate (new round -> judge -> clip), localize (2 markets -> image per scene +
-  music), forced final; plus input-validation errors (400/404/409/422 JSON).
+* **Narration (§9)**: one ``voiceover`` per scene before the first cut; WebVTT captions served as ``text/vtt`` with
+  one cue per line; the narration is audible in the cut (``volumedetect`` on a line's window).
+* **Actions**: edit (clip v2 + adaptive re-score + re-stitch), direct (fan-out edits + music + re-voice +
+  re-stitch), re-voice one scene, music, select (re-render), regenerate (new round -> judge -> clip), localize
+  (2 markets -> image + narration per scene + music + localized animatic), forced final; plus input-validation
+  errors (400/404/409/422 JSON).
+* **Degradation** (``--inprocess`` only, via monkeypatched model calls): an Omni outage for one scene yields a
+  Ken-Burns fallback clip, a Lyria outage and a failed TTS line still produce a cut, and a failed creative
+  director ends the run with ``status=error`` and a clear error event.
 * **Replay**, a **9:16** run (portrait keyframes + 720x1280 cut), the **429** rate-limit JSON shape and
   **restart persistence** (a fresh server process serves and replays the finished run).
 
@@ -68,7 +74,9 @@ PLAN_BRAND_KEYS = {"name", "palette", "visual_style", "mood", "typography", "pro
 PLAN_SCENE_KEYS = {"id", "title", "beat", "duration_s", "image_prompt", "motion_prompt", "camera", "mood",
                    "energy", "on_screen_text"}
 PLAN_MUSIC_KEYS = {"genre", "bpm", "key", "instruments", "arc"}
-SCENE_KEYS = {"id", "title", "beat", "mood", "energy", "duration_s", "variants", "judge", "winner", "clip"}
+SCENE_KEYS = {"id", "title", "beat", "mood", "energy", "duration_s", "variants", "judge", "winner", "clip",
+              "voiceover"}
+VOICEOVER_KEYS = {"status", "v", "text", "url", "latency_ms", "duration_s", "error"}
 VARIANT_KEYS = {"idx", "round", "url", "latency_ms", "api_path", "score"}
 JUDGE_KEYS = {"round", "winner_index", "rationale", "fix_instructions", "scores", "latency_ms"}
 SCORE_KEYS = {"index", "brief_fit", "brand_consistency", "composition", "continuity", "artifact_free",
@@ -77,17 +85,18 @@ CLIP_KEYS = {"status", "elapsed_ms", "error", "current", "versions"}
 CLIP_VERSION_KEYS = {"v", "url", "instruction", "latency_ms", "api_path", "interaction_id", "fallback"}
 MUSIC_KEYS = {"status", "current", "error", "versions"}
 MUSIC_VERSION_KEYS = {"v", "url", "prompt", "latency_ms", "reason"}
-FINAL_KEYS = {"status", "url", "duration_s", "version"}
+FINAL_KEYS = {"status", "url", "duration_s", "version", "captions_url"}
 DIRECTION_KEYS = {"instruction", "summary", "ts"}
-LOCALIZATION_KEYS = {"status", "plan", "scenes", "music_url"}
-LOC_PLAN_KEYS = {"market", "language", "tagline", "cta", "scene_edits", "music_style"}
+LOCALIZATION_KEYS = {"status", "plan", "scenes", "music_url", "voiceover", "video_url", "captions_url"}
+LOC_PLAN_KEYS = {"market", "language", "tagline", "cta", "scene_edits", "music_style", "voiceover", "voice"}
 METRICS_KEYS = {"wall_ms", "images_generated", "image_p50_ms", "image_p95_ms", "images_per_min", "judge_calls",
                 "repair_rounds", "videos_generated", "video_p50_ms", "video_edits", "music_versions", "inflight",
-                "time_to_first_image_ms", "time_to_first_clip_ms", "time_to_final_ms", "api_paths"}
-INFLIGHT_KEYS = {"image", "video", "music", "text"}
+                "time_to_first_image_ms", "time_to_first_clip_ms", "time_to_final_ms", "api_paths",
+                "voiceovers_generated", "tts_p50_ms"}
+INFLIGHT_KEYS = {"image", "video", "music", "text", "tts"}
 
 EXT_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
-            ".mp4": "video/mp4", ".wav": "audio/wav", ".mp3": "audio/mpeg"}
+            ".mp4": "video/mp4", ".wav": "audio/wav", ".mp3": "audio/mpeg", ".vtt": "text/vtt"}
 STITCH_FADE_S = 0.35  # app.media.stitch default crossfade
 
 MARKETS = ["Hyderabad · Telugu", "Mumbai · Hindi"]
@@ -238,6 +247,36 @@ def probe_media(data: bytes, suffix: str) -> dict:
     vm = re.search(r"Stream #\S+.*?: Video:.*?(\d{2,5})x(\d{2,5})", err)
     return {"duration": dur, "width": int(vm.group(1)) if vm else None, "height": int(vm.group(2)) if vm else None,
             "has_audio": bool(re.search(r"Stream #\S+.*?: Audio:", err))}
+
+
+_VTT_CUE = re.compile(r"(\d+):(\d+):(\d+\.\d+)\s+-->\s+(\d+):(\d+):(\d+\.\d+)\s*\n(.+)")
+
+
+def parse_vtt(text: str) -> list[tuple[float, float, str]]:
+    """(start_s, end_s, text) cues of a WebVTT document; raises CheckFailed if the header is missing."""
+    check(text.startswith("WEBVTT"), f"captions must start with WEBVTT, got {text[:20]!r}")
+    cues = []
+    for m in _VTT_CUE.finditer(text):
+        g = m.groups()
+        start = int(g[0]) * 3600 + int(g[1]) * 60 + float(g[2])
+        end = int(g[3]) * 3600 + int(g[4]) * 60 + float(g[5])
+        cues.append((start, end, g[6].strip()))
+    return cues
+
+
+def mean_volume(data: bytes, suffix: str, start: float, duration: float) -> float:
+    """Mean loudness (dBFS) of a media file's audio in [start, start + duration] (-inf -> -120)."""
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+        fh.write(data)
+        path = fh.name
+    try:
+        proc = subprocess.run([ffmpeg_path(), "-hide_banner", "-nostdin", "-ss", f"{start:.3f}", "-t",
+                               f"{duration:.3f}", "-i", path, "-vn", "-af", "volumedetect", "-f", "null", "-"],
+                              capture_output=True, text=True, timeout=60)
+    finally:
+        os.unlink(path)
+    m = re.search(r"mean_volume:\s*(-?[\d.]+) dB", proc.stderr)
+    return float(m.group(1)) if m else -120.0
 
 
 # ========================================================================================== transport
@@ -423,8 +462,9 @@ async def create_run(client: httpx.AsyncClient, *, brief: str, brand: str, aspec
 
 # ========================================================================================== the test
 class E2E:
-    def __init__(self, client: httpx.AsyncClient, report: Report, *, timeout: float) -> None:
+    def __init__(self, client: httpx.AsyncClient, report: Report, *, timeout: float, gm: Any = None) -> None:
         self.c, self.r, self.timeout = client, report, timeout
+        self.gm = gm  # the server's GenMedia when --inprocess (lets degradation steps inject model failures)
         self.run_id: str | None = None
         self.w: EventWatcher | None = None
         self.n_scenes, self.variants = 4, 3
@@ -526,6 +566,12 @@ class E2E:
             check({"url", "instruction", "latency_ms", "api_path", "interaction_id", "fallback"} <= clip.keys(),
                   f"clip payload {clip}")
             check(clip["seq"] < final_ev["seq"], f"{sid} clip must land before the first final")
+            vo = first("voiceover", scene_id=sid)
+            check({"v", "text", "url", "latency_ms", "duration_s"} <= vo.keys() and vo["v"] == 1 and vo["text"],
+                  f"{sid} voiceover payload {vo}")
+            check(vo["seq"] > plan_ev["seq"] and vo["seq"] < final_ev["seq"],
+                  f"{sid} voiceover must land between the plan and the first final")
+        check(final_ev.get("captions_url"), f"first final has no captions_url: {final_ev}")
         errors = [e for e in ev if e["type"] == "error"]
         check(not errors, f"error events during the initial loop: {[e.get('msg') for e in errors]}")
         check(any(e["type"] == "metrics" for e in ev), "no metrics events")
@@ -533,8 +579,10 @@ class E2E:
         first_clip_start = min(e["t"] for e in ev if e["type"] == "stage" and e.get("stage") == "motion")
         last_judge = max(e["t"] for e in ev if e["type"] == "judge")
         music_start = next(e["t"] for e in ev if e["type"] == "stage" and e.get("stage") == "music")
+        last_vo = max(e["t"] for e in ev if e["type"] == "voiceover")
         self.r.note(f"pipelining: first Omni start t={first_clip_start}ms vs last judge t={last_judge}ms; "
-                    f"music start t={music_start}ms vs anchor t={anchor_ev['t']}ms; repair rounds={repairs}")
+                    f"music start t={music_start}ms vs anchor t={anchor_ev['t']}ms; all narration by "
+                    f"t={last_vo}ms; repair rounds={repairs}")
         return (f"{len(ev)} events, first final v1 after {wall:.1f}s "
                 f"(TTFI {next(e['t'] for e in variants)}ms, repairs {repairs})")
 
@@ -565,6 +613,10 @@ class E2E:
                     miss += missing(SCORE_KEYS, s, f"{sid}.judge.scores")
             for cv in sc["clip"]["versions"]:
                 miss += missing(CLIP_VERSION_KEYS, cv, f"{sid}.clip.versions[{cv.get('v')}]")
+            miss += missing(VOICEOVER_KEYS, sc.get("voiceover"), f"{sid}.voiceover")
+            vo = sc.get("voiceover") or {}
+            check(vo.get("status") == "done" and vo.get("url") and (vo.get("duration_s") or 0) > 0.3,
+                  f"{sid} voiceover not rendered: {vo}")
             idxs = [v["idx"] for v in sc["variants"]]
             check(idxs == sorted(set(idxs)), f"{sid} variant idx must be unique + sorted: {idxs}")
             check(sc["winner"] in idxs, f"{sid} winner {sc['winner']} not in {idxs}")
@@ -585,6 +637,9 @@ class E2E:
         check(m["judge_calls"] >= self.n_scenes and m["videos_generated"] >= self.n_scenes, "judge/video counts")
         check(m["time_to_final_ms"] and m["time_to_first_image_ms"] and m["time_to_first_clip_ms"], "time-to-x unset")
         check(m["time_to_first_image_ms"] <= m["time_to_first_clip_ms"] <= m["time_to_final_ms"], "TTFx ordering")
+        check(m["voiceovers_generated"] >= self.n_scenes and m["tts_p50_ms"], f"tts metrics {m}")
+        plan_voice = plan.get("voice") or {}
+        check(plan_voice.get("name") and plan_voice.get("style"), f"plan.voice {plan_voice}")
         extra = sorted(st.keys() - RUN_KEYS)
         return (f"all CONTRACT §6 keys present; images={m['images_generated']} p50={m['image_p50_ms']}ms "
                 f"img/min={m['images_per_min']}" + (f"; extra top-level keys {extra}" if extra else ""))
@@ -595,12 +650,13 @@ class E2E:
         urls = [st["anchor"]["url"]] if st.get("anchor") else []
         for sc in st["scenes"]:
             urls += [v["url"] for v in sc["variants"]] + [cv["url"] for cv in sc["clip"]["versions"]]
+            urls += [(sc.get("voiceover") or {}).get("url")]
         urls += [mv["url"] for mv in st["music"]["versions"]]
-        if st["final"].get("url"):
-            urls.append(st["final"]["url"])
+        urls += [st["final"].get("url"), st["final"].get("captions_url")]
         for loc in st["localizations"].values():
-            urls += [s["url"] for s in loc.get("scenes", [])] + ([loc["music_url"]] if loc.get("music_url") else [])
-        return urls
+            urls += [s["url"] for s in loc.get("scenes", [])] + [loc.get("music_url")]
+            urls += [v["url"] for v in loc.get("voiceover", [])] + [loc.get("video_url"), loc.get("captions_url")]
+        return [u for u in urls if u]
 
     async def media_all(self, st: dict | None = None) -> str:
         st = st or await get_json(self.c, f"/api/runs/{self.run_id}")
@@ -614,7 +670,8 @@ class E2E:
             ctype = r.headers.get("content-type", "").split(";")[0]
             check(r.status_code == 200, f"GET {url} -> {r.status_code}")
             check(ctype == EXT_MIME.get(ext), f"{url} content-type {ctype!r}, expected {EXT_MIME.get(ext)!r}")
-            check(len(r.content) > 100, f"{url} is suspiciously small ({len(r.content)} bytes)")
+            check(len(r.content) > (20 if ext == ".vtt" else 100),
+                  f"{url} is suspiciously small ({len(r.content)} bytes)")
             total += len(r.content)
         return f"{len(urls)} assets OK ({total / 1e6:.1f} MB)"
 
@@ -644,8 +701,30 @@ class E2E:
               f"final.duration_s {st['final']['duration_s']} != probed {info['duration']:.2f}")
         check((info["width"], info["height"]) == expect_wh, f"final is {info['width']}x{info['height']}")
         check(info["has_audio"], "final cut has no soundtrack")
+        narration = await self.check_narration(st["final"]["url"], st["final"].get("captions_url"),
+                                               [(sc.get("voiceover") or {}).get("text") for sc in st["scenes"]],
+                                               info["duration"])
         return (f"{info['duration']:.2f}s = {len(durs)} clips {sum(durs):.2f}s - {len(durs) - 1}x{STITCH_FADE_S}s "
-                f"fades; {info['width']}x{info['height']} + audio")
+                f"fades; {info['width']}x{info['height']} + audio; {narration}")
+
+    async def check_narration(self, video_url: str, captions_url: str | None, lines: list[str | None],
+                              duration: float) -> str:
+        """Captions have one in-range cue per narrated line, and the narration is audible under its cue."""
+        check(captions_url, f"no captions for {video_url}")
+        r = await self.c.get(captions_url)
+        check(r.status_code == 200 and r.headers.get("content-type", "").startswith("text/vtt"),
+              f"GET {captions_url} -> {r.status_code} {r.headers.get('content-type')}")
+        cues = parse_vtt(r.text)
+        expected = [" ".join(t.split()) for t in lines if t]
+        check([c[2] for c in cues] == expected, f"caption cues {[c[2] for c in cues]} != lines {expected}")
+        for a, b in zip(cues, cues[1:]):
+            check(a[1] <= b[0] + 1e-3, f"caption cues overlap: {a} / {b}")
+        check(all(0 <= c[0] < c[1] <= duration + 0.05 for c in cues), f"caption times outside the cut: {cues}")
+        video = (await self.c.get(video_url)).content
+        start, end, _ = cues[0]
+        loud = mean_volume(video, ".mp4", start + 0.2, max(0.5, min(2.0, end - start - 0.4)))
+        check(loud > -35.0, f"narration window {start:.2f}-{end:.2f}s is near-silent ({loud:.1f} dBFS)")
+        return f"{len(cues)} caption cues, narration {loud:.1f} dBFS"
 
     # ---------------------------------------------------------------- actions
     def _final_after(self, seq: int) -> Callable[[list[dict]], Any]:
@@ -698,7 +777,7 @@ class E2E:
     async def act_direct(self) -> str:
         w = self.w
         mark = w.last_seq
-        instruction = "Make it a monsoon evening — moodier, slower, rain on the windows"
+        instruction = "Make it a monsoon evening — moodier, slower, rain on the windows, dramatic trailer narration"
         await post_json(self.c, f"/api/runs/{self.run_id}/direct", {"instruction": instruction})
         d = await w.wait_for(lambda ev: next(iter(w.after(mark, "direction")), None), self.timeout, "direction")
         dplan = d["plan"]
@@ -714,12 +793,33 @@ class E2E:
         musics = [e for e in w.after(mark, "music") if str(e.get("reason", "")).startswith("direction:")]
         if dplan["music"].get("rescore", True):
             check(musics, "direction asked for a re-score but no music version landed")
-        last = max([e["seq"] for e in clips + musics])
+        vo_targets = {vu["scene_id"] for vu in dplan.get("voiceover_updates") or []}
+        check(vo_targets and dplan.get("voice_style"), f"a tone note must re-voice the narration: {dplan}")
+        vos = w.after(mark, "voiceover")
+        check(vo_targets <= {e["scene_id"] for e in vos}, f"re-voice missing for {vo_targets - {e['scene_id'] for e in vos}}")
+        last = max([e["seq"] for e in clips + musics + vos])
         fin = await self._wait_restitch(last, "direct")
         errs = w.after(mark, "error")
         check(not errs, f"errors during direct: {[e['msg'] for e in errs]}")
-        return (f"{len(targets)} clip edits in parallel + {len(musics)} re-score "
-                f"(restyle={dplan['restyle_keyframes']}); final v{fin['version']}")
+        return (f"{len(targets)} clip edits in parallel + {len(musics)} re-score + {len(vo_targets)} re-voiced "
+                f"({dplan['voice_style']!r}, restyle={dplan['restyle_keyframes']}); final v{fin['version']}")
+
+    async def act_voiceover(self) -> str:
+        w, sid = self.w, "s2"
+        mark = w.last_seq
+        text = "Every sip, a little slower. Every table, a story."
+        await post_json(self.c, f"/api/runs/{self.run_id}/scenes/{sid}/voiceover", {"text": text, "voice": "Puck"})
+        vo = await w.wait_for(lambda ev: next(iter(w.after(mark, "voiceover", scene_id=sid)), None), self.timeout,
+                              f"{sid} re-voice")
+        check(vo["text"] == text and vo["v"] >= 2 and vo["url"], f"re-voice payload {vo}")
+        fin = await self._wait_restitch(vo["seq"], "re-voice")
+        cues = parse_vtt((await self.c.get(fin["captions_url"])).text)
+        check(any(c[2] == text for c in cues), f"new line missing from captions {fin['captions_url']}")
+        st = await get_json(self.c, f"/api/runs/{self.run_id}")
+        sc = next(s for s in st["scenes"] if s["id"] == sid)
+        check(sc["voiceover"]["text"] == text and sc["voiceover"]["voice"] == "Puck", f"state {sc['voiceover']}")
+        await post_json(self.c, f"/api/runs/{self.run_id}/scenes/{sid}/voiceover", {"voice": "../x"}, status=422)
+        return f"{sid} v{vo['v']} ({vo['latency_ms']}ms, {vo['duration_s']}s); final v{fin['version']} re-captioned"
 
     async def act_music(self) -> str:
         w = self.w
@@ -789,12 +889,25 @@ class E2E:
                   f"{mk} localize_image scenes {[e['scene_id'] for e in imgs]}")
             mus = w.after(mark, "localize_music", market=mk)
             check(len(mus) == 1 and mus[0]["url"], f"{mk} localize_music {mus}")
-            summary.append(f"{mk}: {len(imgs)} img + music ({lp[0]['plan']['language']})")
+            vos = w.after(mark, "localize_voiceover", market=mk)
+            check({e["scene_id"] for e in vos} == {f"s{i}" for i in range(1, self.n_scenes + 1)}
+                  and all(e["text"] and e["url"] for e in vos), f"{mk} localize_voiceover {vos}")
+            vid = w.after(mark, "localize_video", market=mk)
+            check(len(vid) == 1 and vid[0]["url"] and vid[0]["captions_url"] and vid[0]["duration_s"] > 5,
+                  f"{mk} localize_video {vid}")
+            check(vid[0]["seq"] < st[-1]["seq"], f"{mk} localize_video must precede localize done")
+            info = probe_media((await self.c.get(vid[0]["url"])).content, ".mp4")
+            check(info["has_audio"] and abs(info["duration"] - vid[0]["duration_s"]) < 0.2, f"{mk} animatic {info}")
+            await self.check_narration(vid[0]["url"], vid[0]["captions_url"], [e["text"] for e in
+                                       sorted(vos, key=lambda e: e["scene_id"])], info["duration"])
+            summary.append(f"{mk}: {len(imgs)} img + {len(vos)} VO + music + {info['duration']:.1f}s animatic "
+                           f"({lp[0]['plan']['language']})")
         st = await get_json(self.c, f"/api/runs/{self.run_id}")
         for mk in MARKETS:
             loc = st["localizations"].get(mk)
             check(loc and missing(LOCALIZATION_KEYS, loc, f"localizations[{mk}]") == [], f"state localization {mk}")
-            check(len(loc["scenes"]) == self.n_scenes and loc["music_url"], f"state localization {mk} incomplete")
+            check(len(loc["scenes"]) == self.n_scenes and loc["music_url"] and loc["video_url"]
+                  and len(loc["voiceover"]) == self.n_scenes, f"state localization {mk} incomplete")
         return "; ".join(summary)
 
     async def act_final(self) -> str:
@@ -887,6 +1000,102 @@ class E2E:
         detail = await self.final_duration(st, expect_wh=(720, 1280))
         return f"run {rid}: keyframe {size[0]}x{size[1]}; final {detail}"
 
+    # ---------------------------------------------------------------- degradation (in-process only)
+    async def degraded_run(self) -> str:
+        """Omni fails for one scene, Lyria is down and one TTS line fails: the run must still cut a film."""
+        from app.genai_client import GenAIError  # noqa: WPS433 - only importable in-process
+
+        gm = self.gm
+        orig = {name: getattr(gm, name) for name in ("generate_video", "generate_music", "generate_speech")}
+        calls = {"video": 0, "speech": 0}
+
+        async def flaky_video(*a: Any, **kw: Any):
+            calls["video"] += 1
+            if calls["video"] == 1:
+                raise GenAIError("forced Omni outage (e2e)", model="omni", api_path="interactions")
+            return await orig["generate_video"](*a, **kw)
+
+        async def dead_music(*_a: Any, **_kw: Any):
+            raise GenAIError("forced Lyria outage (e2e)", model="lyria", api_path="interactions")
+
+        async def flaky_speech(*a: Any, **kw: Any):
+            calls["speech"] += 1
+            if calls["speech"] == 1:
+                raise GenAIError("forced TTS outage (e2e)", model="tts", api_path="generate_content")
+            return await orig["generate_speech"](*a, **kw)
+
+        gm.generate_video, gm.generate_music, gm.generate_speech = flaky_video, dead_music, flaky_speech
+        try:
+            r = await create_run(self.c, brief="EV scooter for Gen-Z commuters", brand="Zipp", aspect="16:9",
+                                 n_scenes=3, variants=2, markets=[], product=None)
+            check(r.status_code == 200, f"POST -> {r.status_code}: {r.text[:200]}")
+            rid = r.json()["run_id"]
+            w = EventWatcher(self.c, rid)
+            w.start()
+            try:
+                await w.wait_for(lambda ev: any(e["type"] == "run_done" for e in ev), self.timeout,
+                                 "degraded run_done")
+            finally:
+                await w.stop()
+        finally:
+            for name, fn in orig.items():
+                setattr(gm, name, fn)
+        fallbacks = [e for e in w.of("clip") if e.get("fallback") == "ken_burns"]
+        check(len(fallbacks) == 1 and fallbacks[0]["api_path"] == "fallback", f"fallback clips {fallbacks}")
+        check(any("Ken Burns" in str(e.get("msg")) for e in w.of("log", level="warn")), "no warn log for fallback")
+        check({e["stage"] for e in w.of("error")} <= {"music"}, f"unexpected errors {w.of('error')}")
+        check(len(w.of("voiceover_status", status="error")) == 1 and len(w.of("voiceover")) == 2,
+              "expected exactly one failed narration line")
+        st = await get_json(self.c, f"/api/runs/{rid}")
+        check(st["status"] == "done" and st["music"]["status"] == "error", f"status {st['status']}/{st['music']}")
+        check(all(sc["clip"]["status"] == "done" for sc in st["scenes"]), "every scene must have a clip")
+        info = probe_media((await self.c.get(st["final"]["url"])).content, ".mp4")
+        check(info["has_audio"], "narration-only cut must still carry audio")
+        cues = parse_vtt((await self.c.get(st["final"]["captions_url"])).text)
+        check(len(cues) == 2, f"captions should skip the failed line, got {len(cues)} cues")
+        # With no soundtrack the audio is narration alone: loud under a cue, silent in the widest gap between cues.
+        video = (await self.c.get(st["final"]["url"])).content
+        edges = [0.0] + [t for c in cues for t in c[:2]] + [info["duration"]]
+        gap = max(((a, b) for a, b in zip(edges[::2], edges[1::2])), key=lambda g: g[1] - g[0])
+        check(gap[1] - gap[0] >= 0.8, f"no narration-free gap to measure: {cues}")
+        voiced = mean_volume(video, ".mp4", cues[0][0] + 0.2, max(0.5, min(2.0, cues[0][1] - cues[0][0] - 0.4)))
+        silent = mean_volume(video, ".mp4", gap[0] + 0.2, gap[1] - gap[0] - 0.4)
+        check(voiced > -35.0 and voiced - silent > 30.0,
+              f"narration not audible: cue window {voiced:.1f} dBFS vs gap {silent:.1f} dBFS")
+        return (f"run {rid}: {fallbacks[0]['scene_id']} -> ken_burns fallback, no soundtrack, 1 line dropped; "
+                f"final {info['duration']:.1f}s, {len(cues)} cues, narration {voiced:.1f} dBFS vs gap "
+                f"{silent:.1f} dBFS")
+
+    async def director_failure(self) -> str:
+        """A failing creative director must end the run with status=error and a clear error event."""
+        from app.genai_client import GenAIError  # noqa: WPS433
+
+        gm = self.gm
+        orig = gm.generate_json
+
+        async def dead_json(*_a: Any, **_kw: Any):
+            raise GenAIError("forced text-model outage (e2e)", model="flash", api_path="generate_content")
+
+        gm.generate_json = dead_json
+        try:
+            r = await create_run(self.c, brief="Director outage probe", brand="", aspect="16:9", n_scenes=3,
+                                 variants=2, markets=[], product=None)
+            rid = r.json()["run_id"]
+            w = EventWatcher(self.c, rid)
+            w.start()
+            try:
+                err = await w.wait_for(lambda ev: next((e for e in ev if e["type"] == "error"), None), 30,
+                                       "director error event")
+            finally:
+                await w.stop()
+        finally:
+            gm.generate_json = orig
+        check(err["stage"] == "director" and "forced text-model outage" in err["msg"], f"error event {err}")
+        await asyncio.sleep(0.2)
+        st = await get_json(self.c, f"/api/runs/{rid}")
+        check(st["status"] == "error" and st["plan"] is None, f"status {st['status']}")
+        return f"run {rid}: status=error, {err['msg']!r}"
+
     # ---------------------------------------------------------------- rate limit
     async def rate_limit(self) -> str:
         h = await get_json(self.c, "/api/health")
@@ -961,8 +1170,9 @@ async def restart_checks(client: httpx.AsyncClient, report: Report, run_id: str,
 
 
 # ========================================================================================== drivers
-async def main_phase(client: httpx.AsyncClient, report: Report, args: argparse.Namespace) -> str | None:
-    t = E2E(client, report, timeout=args.timeout)
+async def main_phase(client: httpx.AsyncClient, report: Report, args: argparse.Namespace,
+                     gm: Any = None) -> str | None:
+    t = E2E(client, report, timeout=args.timeout, gm=gm)
     try:
         await run_step(report, "health + static", t.health, fatal=True)
         await run_step(report, "transcribe", t.transcribe)
@@ -974,16 +1184,22 @@ async def main_phase(client: httpx.AsyncClient, report: Report, args: argparse.N
         await run_step(report, "final duration vs clips (ffmpeg)", t.final_duration)
         await run_step(report, "input validation errors", t.act_validation)
         await run_step(report, "edit s1 -> v2 + re-score + re-stitch", t.act_edit)
-        await run_step(report, "direct whole ad (fan-out)", t.act_direct)
+        await run_step(report, "direct whole ad (fan-out + re-voice)", t.act_direct)
+        await run_step(report, "re-voice s2 -> new line + re-stitch", t.act_voiceover)
         await run_step(report, "music re-score", t.act_music)
         await run_step(report, "select override -> re-render", t.act_select)
         await run_step(report, "regenerate s3", t.act_regenerate)
-        await run_step(report, "localize 2 markets", t.act_localize)
+        await run_step(report, "localize 2 markets (+ narration + animatic)", t.act_localize)
         await run_step(report, "forced final", t.act_final)
         await run_step(report, "final state + all media re-check", t.final_state)
         await run_step(report, "runs list + showcase", t.listings)
         await run_step(report, "replay=1 SSE", t.replay)
         await run_step(report, "9:16 run (3x2, portrait)", t.portrait_run)
+        if gm is not None:
+            await run_step(report, "degraded run (Omni/Lyria/TTS failures)", t.degraded_run)
+            await run_step(report, "director failure -> status=error", t.director_failure)
+        else:
+            report.note("degradation steps need --inprocess (they inject model failures)")
         if not args.skip_rate_limit:
             await run_step(report, "rate limit 429 JSON", t.rate_limit)
         if t.w:
@@ -1026,7 +1242,7 @@ async def amain(args: argparse.Namespace) -> int:
                 if args.phase == "restart":
                     await restart_checks(client, report, args.run_id, args.timeout)
                 else:
-                    run_id = await main_phase(client, report, args)
+                    run_id = await main_phase(client, report, args, gm=app.state.gm)
     else:
         async with httpx.AsyncClient(base_url=args.base, timeout=limits, trust_env=False) as client:
             if args.phase == "restart":

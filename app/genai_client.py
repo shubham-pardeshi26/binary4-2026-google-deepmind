@@ -80,6 +80,7 @@ LANGUAGE_CODES = {
     "thai": "th-TH", "vietnamese": "vi-VN", "turkish": "tr-TR", "russian": "ru-RU", "dutch": "nl-NL",
 }
 
+_LANG_CODE_RE = re.compile(r"[a-z]{2,3}(-[A-Za-z]{2,4})?")
 _KEY_RE = re.compile(r"AIza[0-9A-Za-z_\-]{20,}|(key=)[^&\s'\"]+")
 
 
@@ -298,7 +299,7 @@ def language_code(language: str | None) -> str | None:
     if not language:
         return None
     text = language.strip()
-    if re.fullmatch(r"[a-z]{2,3}(-[A-Za-z]{2,4})?", text):
+    if _LANG_CODE_RE.fullmatch(text):
         return text
     for word in re.split(r"[^A-Za-z]+", text.lower())[::-1]:
         if word in LANGUAGE_CODES:
@@ -393,18 +394,20 @@ class GenMedia:
             "image": asyncio.Semaphore(settings.image_concurrency),
             "video": asyncio.Semaphore(settings.video_concurrency),
             "text": asyncio.Semaphore(settings.text_concurrency),
-            "music": asyncio.Semaphore(getattr(settings, "music_concurrency", 3)),
+            "music": asyncio.Semaphore(settings.music_concurrency),
+            "tts": asyncio.Semaphore(settings.tts_concurrency),
         }
-        self._inflight = {"image": 0, "video": 0, "music": 0, "text": 0}
+        self._inflight = {"image": 0, "video": 0, "music": 0, "text": 0, "tts": 0}
         self._stats: dict[str, _ModelStats] = {}
         self._paths: dict[str, str] = {}  # (model|role) key -> api path that last worked
+        self._levels: dict[tuple[str, str], int] = {}  # (key, path) -> request-shape level that worked
         self._overrides: dict[str, str] = dict(getattr(settings, "path_overrides", {}) or {})
         self._timeout = float(getattr(settings, "request_timeout_seconds", 150.0))
         self._mock_counters: dict[str, int] = {}
         # Pre-register every configured model so /api/health shows them before the first call.
         for role, model in (("text", settings.model_text), ("image", settings.model_image),
                             ("video", settings.model_video), ("music", settings.model_music),
-                            ("transcribe", settings.model_transcribe)):
+                            ("transcribe", settings.model_transcribe), ("tts", settings.model_tts)):
             self._stat(model, role)
         self._client = None
         self._types = None
@@ -413,16 +416,18 @@ class GenMedia:
             from google.genai import types
 
             self._types = types
-            kwargs: dict[str, Any] = {"api_key": settings.api_key}
-            if http_options is not None:
-                kwargs["http_options"] = http_options
-            self._client = genai.Client(**kwargs)
+            # GenMedia owns retries (_with_backoff); a single SDK attempt keeps them from multiplying
+            # (the interactions client otherwise retries 3x on 429/5xx underneath ours).
+            opts = http_options if http_options is not None else types.HttpOptions()
+            if opts.retry_options is None:
+                opts.retry_options = types.HttpRetryOptions(attempts=1)
+            self._client = genai.Client(api_key=settings.api_key, http_options=opts)
 
     # ── telemetry ────────────────────────────────────────────────────────────
 
     @property
     def inflight(self) -> dict[str, int]:
-        """Current in-flight request counts per modality (image/video/music/text)."""
+        """Current in-flight request counts per modality (image/video/music/text/tts)."""
         return dict(self._inflight)
 
     def api_paths(self) -> dict[str, str]:
@@ -430,7 +435,12 @@ class GenMedia:
         return {m: s.api_path for m, s in self._stats.items() if s.api_path}
 
     def stats(self) -> dict:
-        """Per-model telemetry: ``{model: {role, calls, errors, api_path, p50_ms, p95_ms, last_error}}``."""
+        """Per-model telemetry.
+
+        ``{model: {role, calls, errors, api_path, shape_level, p50_ms, p95_ms, last_error}}`` where
+        ``role`` is text/image/video/music/transcribe/tts and ``shape_level`` is the request-shape
+        level that last worked on that path (0 = full request).
+        """
         out: dict[str, dict] = {}
         for model, st in self._stats.items():
             lat = list(st.latencies)
@@ -439,6 +449,7 @@ class GenMedia:
                 "calls": st.calls,
                 "errors": st.errors,
                 "api_path": st.api_path,
+                "shape_level": self._levels.get((model, st.api_path)) if st.api_path else None,
                 "p50_ms": _percentile(lat, 50),
                 "p95_ms": _percentile(lat, 95),
                 "last_error": st.last_error,
@@ -488,39 +499,49 @@ class GenMedia:
         raise RuntimeError("unreachable")  # pragma: no cover
 
     async def _execute(self, role: str, model: str, attempts: list[_Attempt], *,
-                       memory_key: str | None = None, reorder: bool = True) -> GenResult:
+                       memory_key: str | None = None, reorder: bool = True,
+                       deadline: float | None = None) -> GenResult:
         """Run ``attempts`` with path memory, shape ladder, backoff and stats.
 
         Returns the first successful :class:`GenResult`; raises :class:`GenAIError`
-        (UI-safe) when every path failed.
+        (UI-safe) when every path failed. Fallback happens only for "this path or
+        shape is wrong" failures (400/403/404/empty output/terminal status):
+        refusals and exhausted transient errors are raised straight away.
+        ``deadline`` (a ``time.perf_counter()`` value) stops the ladder once passed.
         """
         key = memory_key or model
         st = self._stat(model, role)
         st.calls += 1
         failures: list[tuple[str, BaseException]] = []
         for att in (self._ordered(role, key, attempts) if reorder else attempts):
-            level = 0
+            level = min(self._levels.get((key, att.path), 0), att.levels - 1)
             while True:
+                if deadline is not None and time.perf_counter() > deadline and failures:
+                    st.errors += 1
+                    raise self._error(model, failures)
                 t0 = time.perf_counter()
                 try:
                     result = await self._with_backoff(lambda: att.run(level), model, att.path)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - every failure becomes a fallback/GenAIError
+                    log.warning("%s via %s (level %d) failed: %s", model, att.path, level, _short_reason(exc))
+                    failures.append((att.path, exc))
+                    if isinstance(exc, _Blocked) or _is_transient(exc):
+                        # Refusals are deterministic and quota is per model: another path won't help.
+                        st.errors += 1
+                        raise self._error(model, failures[-1:]) from exc
                     code = _status_code(exc)
                     shrinkable = code in (400, 422) or isinstance(exc, _EmptyOutput)
                     if shrinkable and level + 1 < att.levels:
-                        log.info("%s via %s: %s -> retrying with a smaller request (level %d)",
-                                 model, att.path, _short_reason(exc), level + 1)
                         level += 1
                         continue
-                    log.warning("%s via %s failed: %s", model, att.path, _short_reason(exc))
-                    failures.append((att.path, exc))
                     break
                 if not result.latency_ms:
                     result.latency_ms = int((time.perf_counter() - t0) * 1000)
                 if att.remember:
                     self._paths[key] = att.path
+                    self._levels[(key, att.path)] = level
                 st.api_path = result.api_path
                 st.latencies.append(result.latency_ms)
                 return result
@@ -604,21 +625,60 @@ class GenMedia:
         return None
 
     @staticmethod
-    def _gc_why_empty(resp: Any) -> str:
-        """Explain an empty generate_content response (block reason / finish reason / text)."""
+    def _gc_empty_error(resp: Any, model: str) -> Exception:
+        """Exception for a generate_content response without media.
+
+        Safety/policy refusals become :class:`_Blocked` (final); anything else is an
+        :class:`_EmptyOutput` so the shape ladder / fallback can try again.
+        """
         feedback = _get(resp, "prompt_feedback")
         block = _get(feedback, "block_reason")
         if block:
-            return f"blocked ({block})"
+            return _Blocked(f"{model}: request blocked by safety filters ({block})", model=model,
+                            api_path="generate_content")
         for cand in _get(resp, "candidates") or []:
             reason = _get(cand, "finish_reason")
+            if reason and _is_block_reason(reason):
+                return _Blocked(f"{model}: output blocked by safety filters ({reason})", model=model,
+                                api_path="generate_content")
             if reason and str(reason) not in ("FinishReason.STOP", "STOP"):
-                return f"finish reason {reason}"
+                return _EmptyOutput(f"finish reason {reason}")
         try:
             text = (resp.text or "").strip()
         except Exception:  # noqa: BLE001 - .text raises on some multi-part responses
             text = ""
-        return f"no media returned ({text[:80]})" if text else "no media returned"
+        return _EmptyOutput(f"no media returned ({text[:80]})" if text else "no media returned")
+
+    @staticmethod
+    def _ia_find(ia: Any, kind: str) -> Any:
+        """Last output content block of ``kind`` (``"image" | "audio" | "video"``) in an interaction.
+
+        Prefers the SDK convenience prop (``output_<kind>``, built from ``steps``) but also scans
+        the legacy top-level ``outputs`` list — the SDK only normalises that shape for two named
+        Lyria preview ids, so other models answering in it would otherwise look empty.
+        """
+        found = _get(ia, f"output_{kind}")
+        if found is not None:
+            return found
+        extra = getattr(ia, "model_extra", None) or {}
+        outputs = _get(ia, "outputs") or extra.get("outputs") or []
+        for step in reversed(_get(ia, "steps") or []):
+            if _get(step, "type") == "model_output":
+                outputs = list(outputs) + list(_get(step, "content") or [])
+        for item in reversed(list(outputs)):
+            if _get(item, "type") == kind:
+                return item
+        return None
+
+    @staticmethod
+    def _ia_text(ia: Any) -> str:
+        """Text output of an interaction (``output_text`` or the legacy ``outputs`` text items)."""
+        text = _get(ia, "output_text")
+        if text:
+            return text
+        extra = getattr(ia, "model_extra", None) or {}
+        outputs = _get(ia, "outputs") or extra.get("outputs") or []
+        return "".join(str(_get(item, "text") or "") for item in outputs if _get(item, "type") == "text")
 
     async def _ia_content_bytes(self, content: Any, what: str) -> tuple[bytes, str]:
         """Bytes + mime from an Interactions content block (inline ``data`` or ``uri``)."""
@@ -630,11 +690,56 @@ class GenMedia:
             return data, mime
         uri = _get(content, "uri")
         if uri:
-            return await self._download(uri), mime
+            return await self._fetch_media(uri), mime
         raise _EmptyOutput(f"{what} output had neither data nor uri")
+
+    async def _fetch_media(self, uri: str) -> bytes:
+        """Download a *finished* render, retrying only the download.
+
+        Generation is never re-run from here: a final download failure becomes a
+        non-transient :class:`GenAIError`, so the outer backoff does not start a new
+        (expensive) render just because fetching the old one flaked.
+        """
+        last: BaseException | None = None
+        for attempt in range(len(BACKOFF_SCHEDULE) + 1):
+            try:
+                return await self._download(uri)
+            except asyncio.CancelledError:
+                raise
+            except _EmptyOutput:
+                raise
+            except Exception as exc:  # noqa: BLE001 - classified below
+                last = exc
+                if attempt >= len(BACKOFF_SCHEDULE) or not (_is_transient(exc) or isinstance(exc, asyncio.TimeoutError)):
+                    break
+                await asyncio.sleep(BACKOFF_SCHEDULE[attempt])
+        raise GenAIError(f"render finished but download failed: {_short_reason(last or Exception('unknown'))}",
+                         status_code=None)
+
+    @staticmethod
+    def _trusted_host(uri: str) -> bool:
+        """Only Google API hosts may receive the API key header."""
+        try:
+            host = httpx.URL(uri).host or ""
+        except Exception:  # noqa: BLE001 - malformed URI: never attach the key
+            return False
+        return host == "googleapis.com" or host.endswith(".googleapis.com")
+
+    async def _http_get(self, http: httpx.AsyncClient, uri: str) -> httpx.Response:
+        """GET following redirects manually so the API key never leaves ``*.googleapis.com``."""
+        for _ in range(5):
+            headers = {"x-goog-api-key": self.settings.api_key or ""} if self._trusted_host(uri) else {}
+            resp = await http.get(uri, headers=headers)
+            if resp.is_redirect and resp.headers.get("location"):
+                uri = str(resp.url.join(resp.headers["location"]))
+                continue
+            return resp
+        raise GenAIError("download failed: too many redirects", status_code=None)
 
     async def _download(self, uri: str) -> bytes:
         """Download a generated asset URI (Files API names or HTTPS URLs needing the API key)."""
+        if uri.startswith("gs://"):
+            raise _EmptyOutput("output was a gs:// URI (needs delivery=inline)")
         if "files/" in uri and (not uri.startswith("http") or "generativelanguage" in uri):
             try:  # Files API resource (name or URI): let the SDK resolve ':download?alt=media'.
                 data = await self._timed(self._client.aio.files.download(file=uri), 180)
@@ -646,18 +751,17 @@ class GenMedia:
                 log.info("files.download(%s) failed (%s); trying direct GET", _redact(uri), _short_reason(exc))
             if not uri.startswith("http"):
                 raise _EmptyOutput("could not download generated file")
-        headers = {"x-goog-api-key": self.settings.api_key or ""}
-        async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as http:
-            resp = await http.get(uri, headers=headers)
+        async with httpx.AsyncClient(follow_redirects=False, timeout=120.0) as http:
+            resp = await self._http_get(http, uri)
             if resp.status_code >= 400 and "alt=media" not in uri and "generativelanguage" in uri:
-                resp = await http.get(uri + ("&" if "?" in uri else "?") + "alt=media", headers=headers)
+                resp = await self._http_get(http, uri + ("&" if "?" in uri else "?") + "alt=media")
             resp.raise_for_status()
             if resp.headers.get("content-type", "").startswith("application/json"):
                 # Files API metadata instead of media: follow its download link if present.
                 meta = resp.json()
                 link = meta.get("downloadUri") or _get(meta.get("file"), "downloadUri")
                 if link and link != uri:
-                    resp = await http.get(link, headers=headers)
+                    resp = await self._http_get(http, link)
                     resp.raise_for_status()
             return resp.content
 
@@ -670,36 +774,59 @@ class GenMedia:
 
     async def _await_interaction(self, ia: Any, *, model: str, timeout: float,
                                  on_progress: ProgressCB = None, t0: float | None = None) -> Any:
-        """Poll ``interactions.get`` until ``ia`` is terminal; raise on failure/timeout."""
+        """Poll ``interactions.get`` until ``ia`` is terminal; raise on failure/timeout.
+
+        Policy failures raise :class:`_Blocked`; a poll that fails for good raises a
+        non-HTTP :class:`GenAIError` (so a 404 on ``get`` is not mistaken for "model
+        not on this path"). On timeout or cancellation the server-side interaction is
+        cancelled best-effort so abandoned renders stop consuming quota.
+        """
         t0 = t0 or time.perf_counter()
         poll = max(0.2, float(self.settings.video_poll_seconds))
         misses = 0
-        while True:
-            status = str(_get(ia, "status") or "").lower()
-            if status == "completed":
-                return ia
-            if status in FAILED_STATES:
-                raise GenAIError(f"{model} via interactions: {status}: {self._ia_error(ia)}",
-                                 model=model, api_path="interactions")
-            elapsed = time.perf_counter() - t0
-            if elapsed > timeout:
-                raise GenAIError(f"{model} via interactions: timed out after {int(elapsed)}s",
-                                 model=model, api_path="interactions")
-            await self._progress(on_progress, "queued" if status == "queued" else "in_progress", t0)
-            ia_id = _get(ia, "id")
-            if not ia_id:
-                raise _EmptyOutput(f"interaction pending ({status or 'unknown'}) but has no id to poll")
-            await asyncio.sleep(poll)
-            try:
-                ia = await self._timed(self._client.aio.interactions.get(ia_id), 60)
-                misses = 0
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - tolerate flaky polls
-                misses += 1
-                if misses >= 5 or not (_is_transient(exc) or isinstance(exc, asyncio.TimeoutError)):
+        try:
+            while True:
+                status = str(_get(ia, "status") or "").lower()
+                if status == "completed":
+                    return ia
+                if status in FAILED_STATES:
+                    reason = self._ia_error(ia)
+                    cls = _Blocked if _is_block_reason(reason) else GenAIError
+                    raise cls(f"{model} via interactions: {status}: {reason}", model=model, api_path="interactions")
+                elapsed = time.perf_counter() - t0
+                if elapsed > timeout:
+                    await self._cancel_interaction(ia)
+                    raise GenAIError(f"{model} via interactions: timed out after {int(elapsed)}s",
+                                     model=model, api_path="interactions")
+                await self._progress(on_progress, "queued" if status == "queued" else "in_progress", t0)
+                ia_id = _get(ia, "id")
+                if not ia_id:
+                    raise _EmptyOutput(f"interaction pending ({status or 'unknown'}) but has no id to poll")
+                await asyncio.sleep(poll)
+                try:
+                    ia = await self._timed(self._client.aio.interactions.get(ia_id), 60)
+                    misses = 0
+                except asyncio.CancelledError:
                     raise
-                log.warning("%s poll error (%s); continuing", model, _short_reason(exc))
+                except Exception as exc:  # noqa: BLE001 - tolerate flaky polls
+                    misses += 1
+                    if misses >= 5 or not (_is_transient(exc) or isinstance(exc, asyncio.TimeoutError)):
+                        raise GenAIError(f"{model} via interactions: lost track of {ia_id}: {_short_reason(exc)}",
+                                         model=model, api_path="interactions", status_code=None) from exc
+                    log.warning("%s poll error (%s); continuing", model, _short_reason(exc))
+        except asyncio.CancelledError:
+            await asyncio.shield(self._cancel_interaction(ia))
+            raise
+
+    async def _cancel_interaction(self, ia: Any) -> None:
+        """Best-effort server-side cancel of a pending interaction (never raises)."""
+        ia_id = _get(ia, "id")
+        if not ia_id or str(_get(ia, "status") or "").lower() in FAILED_STATES | {"completed"}:
+            return
+        try:
+            await asyncio.wait_for(self._client.aio.interactions.cancel(ia_id), 10)
+        except Exception:  # noqa: BLE001 - cancellation is advisory
+            log.info("could not cancel interaction %s", ia_id)
 
     @staticmethod
     async def _progress(cb: ProgressCB, status: str, t0: float) -> None:
@@ -803,6 +930,40 @@ class GenMedia:
         return req
 
     @staticmethod
+    def speech_prompt(text: str, *, style: str | None, language: str | None) -> str:
+        """Gemini TTS prompt: a natural-language delivery directive, then the exact line to speak."""
+        style = (style or "").strip().rstrip(".")
+        article = "an" if style[:1].lower() in "aeiou" else "a"
+        directive = f"Say in {article} {style} voice" if style else "Say"
+        # Name non-English languages ("in Telugu"; "Hyderabad · Telugu" -> Telugu); codes go only in the config.
+        name = next((w for w in re.split(r"[^A-Za-z]+", (language or "").lower())[::-1] if w in LANGUAGE_CODES), "")
+        if name and LANGUAGE_CODES[name] != "en-US":
+            directive += f", in {name.capitalize()}"
+        return f"{directive}: {text.strip()}"
+
+    def build_speech_gc_config(self, *, voice: str, language: str | None, level: int) -> Any:
+        """GenerateContentConfig for Gemini TTS. Level 0: voice + language_code; level 1: voice only."""
+        types = self._types
+        speech: dict[str, Any] = {"voice_config": types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))}
+        code = language_code(language)
+        if level == 0 and code:
+            speech["language_code"] = code
+        return self._gc_config(response_modalities=["AUDIO"], speech_config=types.SpeechConfig(**speech))
+
+    @staticmethod
+    def build_speech_ia_request(model: str, prompt: str, *, voice: str, language: str | None, level: int) -> dict:
+        """Interactions create() kwargs for TTS. Level 0: speech_config (voice + language); level 1: bare."""
+        req: dict[str, Any] = {"model": model, "input": prompt, "response_modalities": ["audio"]}
+        if level == 0:
+            speaker: dict[str, str] = {"voice": voice}
+            code = language_code(language)
+            if code:
+                speaker["language"] = code
+            req["generation_config"] = {"speech_config": [speaker]}
+        return req
+
+    @staticmethod
     def build_transcribe_ia_request(model: str, audio: bytes, mime: str, *, level: int) -> dict:
         """Interactions create() kwargs for transcription. Level 1 swaps config for a text instruction."""
         content: list[dict] = [{"type": "audio", "data": _b64(audio), "mime_type": mime}]
@@ -871,7 +1032,7 @@ class GenMedia:
                                                         "Schema:\n" + json.dumps(schema)})
             ia = await self._timed(self._client.aio.interactions.create(**req))
             ia = await self._await_interaction(ia, model=model, timeout=self._timeout)
-            text = _get(ia, "output_text") or ""
+            text = self._ia_text(ia)
             data = parse_json_loose(text)
             return GenResult(None, "application/json", int((time.perf_counter() - t0) * 1000), model,
                              "interactions", text=json.dumps(data, ensure_ascii=False), meta={"parsed": data})
@@ -897,7 +1058,7 @@ class GenMedia:
             ia = await self._timed(self._client.aio.interactions.create(
                 **self.build_transcribe_ia_request(model, audio, mime, level=level)))
             ia = await self._await_interaction(ia, model=model, timeout=self._timeout)
-            text = (_get(ia, "output_text") or "").strip()
+            text = self._ia_text(ia).strip()
             if not text:
                 raise _EmptyOutput("empty transcript")
             return GenResult(None, "text/plain", int((time.perf_counter() - t0) * 1000), model,
@@ -946,7 +1107,7 @@ class GenMedia:
                 config=self.build_image_gc_config(aspect=aspect, size=size, seed=seed, level=level)))
             media = self._gc_media(resp, "image/")
             if not media:
-                raise _EmptyOutput(self._gc_why_empty(resp))
+                raise self._gc_empty_error(resp, model)
             data, mime = media
             return GenResult(data, _base_mime(mime) or sniff_mime(data), int((time.perf_counter() - t0) * 1000),
                              model, "generate_content")
@@ -956,7 +1117,7 @@ class GenMedia:
             ia = await self._timed(self._client.aio.interactions.create(**self.build_image_ia_request(
                 model, prompt, ref_list, aspect=aspect, size=size, seed=seed, level=level)))
             ia = await self._await_interaction(ia, model=model, timeout=self._timeout, t0=t0)
-            data, mime = await self._ia_content_bytes(_get(ia, "output_image"), "image")
+            data, mime = await self._ia_content_bytes(self._ia_find(ia, "image"), "image")
             return GenResult(data, _base_mime(mime) or sniff_mime(data), int((time.perf_counter() - t0) * 1000),
                              model, "interactions", meta={"interaction_id": _get(ia, "id")})
 
@@ -984,7 +1145,7 @@ class GenMedia:
             await self._progress(on_progress, "queued", t0)
             ia = await self._timed(self._client.aio.interactions.create(**req), timeout)
             ia = await self._await_interaction(ia, model=model, timeout=timeout, on_progress=on_progress, t0=t0)
-            data, mime = await self._ia_content_bytes(_get(ia, "output_video"), "video")
+            data, mime = await self._ia_content_bytes(self._ia_find(ia, "video"), "video")
             return GenResult(data, _base_mime(mime) or "video/mp4", int((time.perf_counter() - t0) * 1000),
                              model, "interactions",
                              meta={"interaction_id": _get(ia, "id"), "operation": None, "fallback": fallback})
@@ -1026,13 +1187,21 @@ class GenMedia:
             vids = _get(resp, "generated_videos") or []
             if not vids:
                 reasons = _get(resp, "rai_media_filtered_reasons")
-                raise _EmptyOutput(f"no video returned{f' ({reasons})' if reasons else ''}")
+                if reasons:
+                    raise _Blocked(f"{model}: video blocked by safety filters ({str(reasons)[:120]})",
+                                   model=model, api_path="generate_videos")
+                raise _EmptyOutput("no video returned")
             vid = _get(vids[0], "video")
             data = _as_bytes(_get(vid, "video_bytes"))
-            if not data:
-                data = await self._timed(self._client.aio.files.download(file=vid), 180)
+            if not data and vid is not None:
+                try:
+                    data = await self._timed(self._client.aio.files.download(file=vid), 180)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - fall back to a direct URI download below
+                    log.info("%s: files.download failed (%s); trying the URI", model, _short_reason(exc))
             if not data and _get(vid, "uri"):
-                data = await self._download(_get(vid, "uri"))
+                data = await self._fetch_media(_get(vid, "uri"))
             if not data:
                 raise _EmptyOutput("video had no downloadable bytes")
             return GenResult(data, _get(vid, "mime_type") or "video/mp4", int((time.perf_counter() - t0) * 1000),
@@ -1084,7 +1253,8 @@ class GenMedia:
         rerender_prompt = (f"{base_prompt.strip()}\n\nDirector's note for this take (takes priority): "
                            f"{instruction.strip()}") if base_prompt else instruction.strip()
         attempts: list[_Attempt] = []
-        if previous_interaction_id:
+        # Mock-mode ids (runs replayed from disk) mean nothing to the live API.
+        if previous_interaction_id and not previous_interaction_id.startswith("mock-"):
             attempts.append(self._video_ia_attempt(
                 model, edit_text, image=None, video=None, aspect=aspect, seconds=seconds, task="edit",
                 previous_interaction_id=previous_interaction_id, on_progress=on_progress, fallback=None,
@@ -1111,7 +1281,9 @@ class GenMedia:
             raise GenAIError(f"{model}: nothing to edit (no interaction id, clip or keyframe)", model=model)
         async with self._slot("video"):
             # Edit ladder order is semantic (multi-turn > single-turn > re-render): never reorder it.
-            return await self._execute("video", model, attempts, reorder=False)
+            # The deadline bounds how long one edit can hold a video slot across the whole ladder.
+            deadline = time.perf_counter() + 1.5 * float(self.settings.video_timeout_seconds)
+            return await self._execute("video", model, attempts, reorder=False, deadline=deadline)
 
     # ── public API: music ─────────────────────────────────────────────────────────
 
@@ -1130,7 +1302,7 @@ class GenMedia:
             ia = await self._timed(self._client.aio.interactions.create(
                 **self.build_music_ia_request(model, full_prompt, level=level)), music_timeout)
             ia = await self._await_interaction(ia, model=model, timeout=music_timeout, t0=t0)
-            data, mime = await self._ia_content_bytes(_get(ia, "output_audio"), "audio")
+            data, mime = await self._ia_content_bytes(self._ia_find(ia, "audio"), "audio")
             data, mime = _normalize_audio(data, mime)
             return GenResult(data, mime, int((time.perf_counter() - t0) * 1000), model, "interactions",
                              meta={"interaction_id": _get(ia, "id")})
@@ -1142,7 +1314,7 @@ class GenMedia:
                 config=self._gc_config(response_modalities=["AUDIO"])), music_timeout)
             media = self._gc_media(resp, "audio/")
             if not media:
-                raise _EmptyOutput(self._gc_why_empty(resp))
+                raise self._gc_empty_error(resp, model)
             data, mime = _normalize_audio(*media)
             return GenResult(data, mime, int((time.perf_counter() - t0) * 1000), model, "generate_content")
 
@@ -1150,6 +1322,56 @@ class GenMedia:
             return await self._execute("music", model, [
                 _Attempt("interactions", via_ia, levels=2),
                 _Attempt("generate_content", via_gc, levels=1),
+            ])
+
+    # ── public API: speech (voiceover) ─────────────────────────────────────────────
+
+    async def generate_speech(self, text: str, *, voice: str = "Kore", style: str | None = None,
+                              language: str | None = None) -> GenResult:
+        """Gemini Flash TTS narration line -> WAV bytes (``audio/wav``).
+
+        ``voice`` is a prebuilt voice name (see :data:`TTS_VOICES`; unknown names fall
+        back to Kore), ``style`` a natural-language delivery note ("warm, confident")
+        and ``language`` a language name or BCP-47 code used as a pronunciation hint.
+        Raw PCM from the API is wrapped in a WAV header; wav/mp3 pass through.
+        """
+        model = self.settings.model_tts
+        text = " ".join((text or "").split())
+        if not text:
+            raise GenAIError(f"{model}: nothing to say (empty voiceover line)", model=model)
+        voice = next((v for v in TTS_VOICES if v.lower() == (voice or "").strip().lower()), "Kore")
+        if self.mock:
+            return await self._mock_speech(text, voice, model)
+        prompt = self.speech_prompt(text, style=style, language=language)
+        meta = {"voice": voice, "text": text}
+
+        def finish(data: bytes, mime: str, t0: float, path: str) -> GenResult:
+            wav, wav_mime = _normalize_audio(data, mime, pcm_rate=TTS_PCM_RATE, unknown_is_pcm=True)
+            return GenResult(wav, wav_mime, int((time.perf_counter() - t0) * 1000), model, path, text=text,
+                             meta=dict(meta))
+
+        async def via_gc(level: int) -> GenResult:
+            t0 = time.perf_counter()
+            resp = await self._timed(self._client.aio.models.generate_content(
+                model=model, contents=prompt,
+                config=self.build_speech_gc_config(voice=voice, language=language, level=level)))
+            media = self._gc_media(resp, "audio/")
+            if not media:
+                raise self._gc_empty_error(resp, model)
+            return finish(*media, t0, "generate_content")
+
+        async def via_ia(level: int) -> GenResult:
+            t0 = time.perf_counter()
+            ia = await self._timed(self._client.aio.interactions.create(
+                **self.build_speech_ia_request(model, prompt, voice=voice, language=language, level=level)))
+            ia = await self._await_interaction(ia, model=model, timeout=self._timeout, t0=t0)
+            data, mime = await self._ia_content_bytes(self._ia_find(ia, "audio"), "audio")
+            return finish(data, mime, t0, "interactions")
+
+        async with self._slot("tts"):
+            return await self._execute("tts", model, [
+                _Attempt("generate_content", via_gc, levels=2),
+                _Attempt("interactions", via_ia, levels=2),
             ])
 
     # ── mock implementations ────────────────────────────────────────────────────────
@@ -1246,6 +1468,14 @@ class GenMedia:
             return GenResult(data, "video/mp4", self._mock_done("video", model, t0), model, "mock",
                              meta={"interaction_id": f"mock-{uuid.uuid4().hex[:12]}", "operation": None,
                                    "fallback": None if previous_interaction_id else "rerender"})
+
+    async def _mock_speech(self, text: str, voice: str, model: str) -> GenResult:
+        async with self._slot("tts"):
+            t0 = time.perf_counter()
+            synth = asyncio.to_thread(mockgen.synth_speech, text, voice)
+            data, _ = await asyncio.gather(synth, self._mock_sleep(0.4, 1.0))
+            return GenResult(data, "audio/wav", self._mock_done("tts", model, t0), model, "mock", text=text,
+                             meta={"voice": voice, "text": text})
 
     async def _mock_music(self, prompt: str, seconds: int, model: str) -> GenResult:
         async with self._slot("music"):

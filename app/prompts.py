@@ -5,7 +5,8 @@ every call goes through :class:`app.genai_client.GenMedia` — and it owns:
 
 * **JSON schemas** (module constants, plain JSON-Schema dicts using only
   ``type/properties/required/items/enum``) for the Plan, Judgement,
-  DirectionPlan, clip-edit interpretation and LocalizePlan contracts.
+  DirectionPlan, clip-edit interpretation and LocalizePlan contracts —
+  including the narrator ``voice`` and per-scene ``voiceover`` lines (§9b).
 * **System prompts** for the creative director, the vision judge, the one-line
   "direct the whole ad" planner, the per-clip edit interpreter and the
   localizer.
@@ -26,7 +27,7 @@ from typing import Any
 
 from app import mock as mockgen
 from app.config import settings
-from app.genai_client import GenMedia, GenResult, img_part
+from app.genai_client import TTS_VOICES, GenMedia, GenResult, img_part
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JSON schemas (kept deliberately simple: type / properties / required / items / enum)
@@ -70,6 +71,7 @@ PLAN_SCHEMA: dict = _obj({
         "mood": _STR,
         "energy": _NUM,
         "on_screen_text": _STR,
+        "voiceover": _STR,
     })},
     "music": _obj({
         "genre": _STR,
@@ -78,6 +80,7 @@ PLAN_SCHEMA: dict = _obj({
         "instruments": {"type": "array", "items": _STR},
         "arc": _STR,
     }),
+    "voice": _obj({"name": {"type": "string", "enum": list(TTS_VOICES)}, "style": _STR}),
 })
 
 JUDGE_SCHEMA: dict = _obj({
@@ -102,6 +105,8 @@ DIRECTION_SCHEMA: dict = _obj({
     "restyle_keyframes": _BOOL,
     "music": _obj({"rescore": _BOOL, "instruction": _STR}),
     "mood_updates": {"type": "array", "items": _obj({"scene_id": _STR, "mood": _STR, "energy": _NUM})},
+    "voiceover_updates": {"type": "array", "items": _obj({"scene_id": _STR, "text": _STR})},
+    "voice_style": _STR,
 })
 
 CLIP_EDIT_SCHEMA: dict = _obj({
@@ -118,7 +123,12 @@ LOCALIZE_SCHEMA: dict = _obj({
     "cta": _STR,
     "scene_edits": {"type": "array", "items": _obj({"scene_id": _STR, "nb2_instruction": _STR})},
     "music_style": _STR,
+    "voiceover": {"type": "array", "items": _obj({"scene_id": _STR, "text": _STR})},
+    "voice": {"type": "string", "enum": list(TTS_VOICES)},
 })
+
+#: Narrator defaults used when the model omits or garbles the voice (CONTRACT §9b).
+DEFAULT_VOICE = {"name": "Kore", "style": "warm, confident, upbeat narrator"}
 
 #: Judge rubric weights used to (re)compute ``overall`` when the model omits it.
 RUBRIC_WEIGHTS = {"brief_fit": 0.25, "brand_consistency": 0.20, "composition": 0.20,
@@ -169,6 +179,20 @@ MUSIC
 - A single coherent brief matching the moods: genre, bpm (integer), key (e.g. "D major"), 3–6 instruments,
   and an arc sentence mapping the music to the beats. Instrumental.
 
+VOICEOVER (one spoken narration line per scene, read by a TTS narrator over that shot)
+- Read in order, the lines tell a mini-story that SELLS: hook = a question or bold claim about the viewer's moment;
+  build = the desire or the everyday problem, sensory and relatable; reveal = name the product and give 1–2
+  CONCRETE benefits (taste, speed, material, feature, number — taken from the brief, never contradicting it);
+  cta = the promise/tagline plus the call to action, ending with the brand name.
+- Hard word budget per line: the VOICEOVER WORD BUDGET in FORMAT (it must be speakable within the shot with a
+  breath to spare). Fewer, stronger words beat more words.
+- Write for the ear: short sentences, contractions, vivid concrete nouns. No hashtags, emojis, URLs, quotation
+  marks, stage directions or "Narrator:" labels. Complement the on-screen text rather than reading it out verbatim.
+- Spoken language: English unless the brief asks for another language (then write in that language's native script).
+- voice.name: the prebuilt narrator that suits the brand — Kore (firm, clear), Puck (upbeat), Charon (warm,
+  informative), Fenrir (excitable), Aoede (breezy), Zephyr (bright), Leda (youthful), Orus (firm, deep).
+  voice.style: a 4–10 word delivery note (e.g. "warm, confident, smiling, unhurried").
+
 anchor_prompt: a clean continuity reference frame — the hero (if any) with the product, three-quarter view, neutral
 backdrop in a light palette colour, soft even studio light, product fully visible and in sharp focus, no text.
 campaign_name: 2–5 memorable words. tagline: <= 8 words. cta: 2–4 words, imperative.
@@ -212,6 +236,12 @@ direction for the whole ad. Translate it into the MINIMAL set of concrete change
 - music: rescore=true if the note changes mood, energy, pacing, genre or setting; instruction = what the new score
   should do (genre/tempo/instrument/mood shifts), one sentence. rescore=false with empty instruction otherwise.
 - mood_updates: new mood (2–4 words) and energy (0.0–1.0) for every scene whose feeling changes.
+- voiceover_updates: the narration lines to re-voice. If the note changes WHAT is said (new offer, new benefit, a
+  different CTA, a new language), rewrite the affected lines (same word budget as the current line, still ending the
+  cta line with the brand name). If it changes only HOW it should sound, list every affected scene with its CURRENT
+  text unchanged. Empty list when the voiceover is unaffected.
+- voice_style: a new 4–10 word delivery note for the narrator when the tone changes (e.g. "make it playful" ->
+  "playful, bright and bouncy, smiling"); empty string otherwise.
 - summary: one short sentence the client sees, e.g. "Shifting all 4 shots to a rain-soaked evening and re-scoring
   with slower, moodier keys."
 Only reference scene ids that exist. Return one JSON object matching the schema.
@@ -240,6 +270,10 @@ You are a senior transcreation lead adapting a finished commercial for a new mar
   If a scene has no on-image text, do not add any.
 - music_style: one sentence describing a regional variant of the soundtrack (instruments/rhythms from the region)
   that keeps the original tempo and arc.
+- voiceover: one entry per scene — transcreate that scene's narration line into the market language in its NATIVE
+  script (never transliterated), natural spoken register, keeping the story role of the line (hook / desire / product
+  benefit / CTA with the brand name kept as-is). Keep it about as long to SAY as the original so it fits the shot.
+- voice: the prebuilt narrator for this market (usually keep the original voice).
 Return one JSON object matching the schema.
 """
 
@@ -278,6 +312,41 @@ def _clip_words(text: str, max_chars: int) -> str:
         return text
     cut = text[:max_chars].rsplit(" ", 1)[0]
     return cut.rstrip(",;:-— ")
+
+
+def vo_text(value: Any) -> str:
+    """A scene's narration line (``value`` is a plan scene's ``voiceover`` string or run-state dict)."""
+    return _s(mockgen.vo_text({"voiceover": value}))
+
+
+def fit_voiceover(text: str, budget: int) -> str:
+    """Trim a narration line to at most ``budget`` words, cutting at a word boundary.
+
+    Prefers ending on a complete sentence when that keeps at least half the
+    budget; otherwise hard-cuts and closes the line with a full stop so the TTS
+    narrator lands it instead of trailing off mid-phrase.
+    """
+    text = _s(text).strip('"“”').strip()
+    words = text.split()
+    if len(words) <= budget:
+        return text
+    kept = words[:budget]
+    min_keep = max(1, budget // 2)
+    for i in range(len(kept) - 1, min_keep - 2, -1):
+        if kept[i][-1] in ".!?。！？।":
+            return " ".join(kept[: i + 1])
+    return " ".join(kept).rstrip(",;:-—–… ") + "."
+
+
+def normalize_voice(raw: Any, default: dict | None = None) -> dict:
+    """Coerce a narrator voice to ``{"name": <prebuilt voice>, "style": str}`` (unknown names -> default)."""
+    default = default or DEFAULT_VOICE
+    if isinstance(raw, str):
+        raw = {"name": raw}
+    raw = raw if isinstance(raw, dict) else {}
+    wanted = _s(raw.get("name")).lower()
+    name = next((v for v in TTS_VOICES if v.lower() == wanted), default["name"])
+    return {"name": name, "style": _clip_words(_s(raw.get("style"), default["style"]), 120)}
 
 
 def _orientation(aspect: str) -> str:
@@ -337,8 +406,11 @@ def _merged_scenes(plan: dict, scenes: list[dict] | None) -> list[dict]:
 
 def _brief_scene_view(sc: dict) -> dict:
     """Compact scene summary sent to text models (keeps prompts small and fast)."""
-    return {k: sc.get(k) for k in ("id", "title", "beat", "mood", "energy", "camera", "on_screen_text",
+    view = {k: sc.get(k) for k in ("id", "title", "beat", "mood", "energy", "camera", "on_screen_text",
                                    "motion_prompt") if k in sc}
+    if vo_text(sc.get("voiceover")):
+        view["voiceover"] = vo_text(sc.get("voiceover"))
+    return view
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -351,8 +423,10 @@ def normalize_plan(raw: dict, *, brief: str, brand: str, aspect: str, n_scenes: 
 
     Guarantees: exactly ``n_scenes`` scenes with ids ``s1..sN`` and the canonical
     beat sequence, integer ``duration_s`` = ``settings.video_seconds``, energies
-    in [0, 1], 4–5 valid ``#RRGGBB`` palette colours, and non-empty prompts.
-    Adds ``plan["aspect"]`` (extra key) for prompt builders.
+    in [0, 1], 4–5 valid ``#RRGGBB`` palette colours, non-empty prompts, a
+    prebuilt narrator ``voice`` and a non-empty ``voiceover`` line per scene that
+    fits ``floor(duration_s * 2.4)`` words. Adds ``plan["aspect"]`` (extra key)
+    for prompt builders.
     """
     if not isinstance(raw, dict):
         raw = {}
@@ -384,6 +458,9 @@ def normalize_plan(raw: dict, *, brief: str, brand: str, aspect: str, n_scenes: 
 
     beats = mockgen.beats_for(n)
     curve = mockgen._energy_curve(beats)  # noqa: SLF001 - shared canonical curve
+    secs = int(settings.video_seconds)
+    budget = mockgen.vo_word_budget(secs)
+    fallback_lines = mockgen.fake_voiceover(brief, beats, brand_out["name"])
     raw_scenes = [s for s in (raw.get("scenes") or []) if isinstance(s, dict)]
     scenes = []
     for i in range(n):
@@ -393,7 +470,7 @@ def normalize_plan(raw: dict, *, brief: str, brand: str, aspect: str, n_scenes: 
             "id": f"s{i + 1}",
             "title": _clip_words(_s(src.get("title"), f"Scene {i + 1}"), 48),
             "beat": beats[i],
-            "duration_s": int(settings.video_seconds),
+            "duration_s": secs,
             "image_prompt": _s(src.get("image_prompt"),
                                f"{brand_out['hero']} with {brand_out['product']}, {brand_out['visual_style']}"),
             "motion_prompt": _s(src.get("motion_prompt"), fb["motion_prompt"]),
@@ -401,6 +478,7 @@ def normalize_plan(raw: dict, *, brief: str, brand: str, aspect: str, n_scenes: 
             "mood": _s(src.get("mood"), brand_out["mood"]),
             "energy": round(_f(src.get("energy"), curve[i]), 2),
             "on_screen_text": _clip_words(_s(src.get("on_screen_text")), 48),
+            "voiceover": fit_voiceover(vo_text(src.get("voiceover")) or fallback_lines[i], budget),
         })
 
     m = raw.get("music") if isinstance(raw.get("music"), dict) else {}
@@ -436,6 +514,7 @@ def normalize_plan(raw: dict, *, brief: str, brand: str, aspect: str, n_scenes: 
         "anchor_prompt": anchor_prompt,
         "scenes": scenes,
         "music": music,
+        "voice": normalize_voice(raw.get("voice")),
         "aspect": aspect if aspect in ("16:9", "9:16") else "16:9",
     }
 
@@ -478,10 +557,17 @@ def normalize_judgement(raw: dict, n_variants: int) -> dict:
     }
 
 
-def normalize_direction(raw: dict, plan: dict, instruction: str) -> dict:
-    """Coerce a DirectionPlan: only known scene ids, one edit per scene, clamped energies."""
+def normalize_direction(raw: dict, plan: dict, instruction: str, scenes: list[dict] | None = None) -> dict:
+    """Coerce a DirectionPlan: only known scene ids, one edit per scene, clamped energies.
+
+    ``scenes`` (optional) are the live scenes (plan overlaid with run state) whose
+    current narration is reused when the model asks for a tone-only re-voice;
+    rewritten lines are fitted to each scene's word budget. ``voice_style`` is
+    ``None`` when the narrator's delivery is unchanged.
+    """
     raw = raw if isinstance(raw, dict) else {}
     valid = [sc["id"] for sc in plan.get("scenes") or [] if sc.get("id")]
+    live = {sc.get("id"): sc for sc in _merged_scenes(plan, scenes)}
     edits, seen = [], set()
     for e in raw.get("scene_edits") or []:
         if not isinstance(e, dict):
@@ -499,9 +585,27 @@ def normalize_direction(raw: dict, plan: dict, instruction: str) -> dict:
             moods.append({"scene_id": sid, "mood": _clip_words(_s(mu.get("mood")), 40),
                           "energy": round(_f(mu.get("energy"), 0.5), 2)})
             mseen.add(sid)
+    voice_style = _clip_words(_s(raw.get("voice_style")), 120) or None
+    vo_updates, vseen = [], set()
+    for vu in raw.get("voiceover_updates") or []:
+        if not isinstance(vu, dict):
+            continue
+        sid = _s(vu.get("scene_id"))
+        if sid not in valid or sid in vseen:
+            continue
+        sc = live.get(sid, {})
+        text = _s(vu.get("text")) or vo_text(sc.get("voiceover"))
+        if text:
+            budget = mockgen.vo_word_budget(sc.get("duration_s") or settings.video_seconds)
+            vo_updates.append({"scene_id": sid, "text": fit_voiceover(text, budget)})
+            vseen.add(sid)
+    if voice_style and not vo_updates:
+        # A new delivery with no listed lines means "re-voice everything, same words".
+        vo_updates = [{"scene_id": sid, "text": vo_text(live[sid].get("voiceover"))}
+                      for sid in valid if sid in live and vo_text(live[sid].get("voiceover"))]
     music = raw.get("music") if isinstance(raw.get("music"), dict) else {}
     rescore = bool(music.get("rescore", bool(moods)))
-    if not edits and not rescore:
+    if not edits and not rescore and not vo_updates:
         # The model produced nothing actionable: apply the note verbatim to every clip.
         edits = [{"scene_id": sid, "omni_instruction": f"{instruction.strip()}. Keep the hero, product, on-screen "
                                                        f"text and framing identical."} for sid in valid]
@@ -511,6 +615,8 @@ def normalize_direction(raw: dict, plan: dict, instruction: str) -> dict:
         "restyle_keyframes": bool(raw.get("restyle_keyframes", False)),
         "music": {"rescore": rescore, "instruction": _s(music.get("instruction"), instruction if rescore else "")},
         "mood_updates": moods,
+        "voiceover_updates": vo_updates,
+        "voice_style": voice_style,
     }
 
 
@@ -528,7 +634,12 @@ def normalize_clip_edit(raw: dict, scene: dict, instruction: str) -> dict:
 
 
 def normalize_localize(raw: dict, plan: dict, market: str) -> dict:
-    """Coerce a LocalizePlan: exactly one nb2 instruction per plan scene."""
+    """Coerce a LocalizePlan: exactly one nb2 instruction and one voiceover line per plan scene.
+
+    Missing narration falls back to the scene's original line (accurate copy beats
+    generic filler); lines are capped at twice the scene's word budget because
+    word counts vary across scripts. ``voice`` is always a prebuilt voice name.
+    """
     raw = raw if isinstance(raw, dict) else {}
     fallback = mockgen.fake_localize(plan=plan, market=market)
     given = {}
@@ -539,6 +650,16 @@ def normalize_localize(raw: dict, plan: dict, market: str) -> dict:
     for fb in fallback["scene_edits"]:
         sid = fb["scene_id"]
         edits.append({"scene_id": sid, "nb2_instruction": given.get(sid, fb["nb2_instruction"])})
+    lines = {}
+    for e in raw.get("voiceover") or []:
+        if isinstance(e, dict) and _s(e.get("scene_id")) and _s(e.get("text")):
+            lines.setdefault(_s(e.get("scene_id")), _s(e.get("text")))
+    voiceover = []
+    for sc in plan.get("scenes") or []:
+        budget = 2 * mockgen.vo_word_budget(sc.get("duration_s") or settings.video_seconds)
+        text = lines.get(sc.get("id")) or vo_text(sc.get("voiceover"))
+        voiceover.append({"scene_id": sc.get("id"), "text": fit_voiceover(text, budget)})
+    plan_voice = normalize_voice(plan.get("voice"))
     return {
         "market": market,
         "language": _s(raw.get("language"), fallback["language"]),
@@ -546,6 +667,8 @@ def normalize_localize(raw: dict, plan: dict, market: str) -> dict:
         "cta": _s(raw.get("cta"), fallback["cta"]),
         "scene_edits": edits,
         "music_style": _s(raw.get("music_style"), fallback["music_style"]),
+        "voiceover": voiceover,
+        "voice": normalize_voice(raw.get("voice"), plan_voice)["name"],
     }
 
 
@@ -556,7 +679,7 @@ def normalize_localize(raw: dict, plan: dict, market: str) -> dict:
 
 async def plan_campaign(gm: GenMedia, *, brief: str, brand: str, aspect: str, n_scenes: int,
                         markets: list[str] | None, product_image: bytes | None) -> tuple[dict, GenResult]:
-    """Brief -> full creative Plan (brand bible, N scene prompts, motion, music brief)."""
+    """Brief -> full creative Plan (brand bible, N scene prompts, motion, music brief, narration)."""
     n = max(1, int(n_scenes))
     beats = mockgen.beats_for(n)
     secs = int(settings.video_seconds)
@@ -565,7 +688,8 @@ async def plan_campaign(gm: GenMedia, *, brief: str, brand: str, aspect: str, n_
         f"BRIEF:\n{brief.strip()}",
         f"BRAND NAME: {brand.strip() if brand and brand.strip() else '(none given — invent a fitting, ownable name)'}",
         f"FORMAT: {aspect} ({_orientation(aspect)}), exactly {n} scenes x {secs}s = a {n * secs}s spot. "
-        f"Composition: {_composition(aspect)}.",
+        f"Composition: {_composition(aspect)}. VOICEOVER WORD BUDGET: at most "
+        f"{mockgen.vo_word_budget(secs)} words per scene line.",
         f"BEAT SHEET (exact order): {beat_sheet}. Scene ids must be s1..s{n}; duration_s = {secs}.",
     ]
     if markets:
@@ -612,12 +736,14 @@ async def judge_scene(gm: GenMedia, *, plan: dict, scene: dict, variants: list[b
 
 async def plan_direction(gm: GenMedia, *, plan: dict, scenes_state: list[dict],
                          instruction: str) -> tuple[dict, GenResult]:
-    """One sentence -> DirectionPlan fanning out to every modality."""
-    scenes = [_brief_scene_view(sc) for sc in _merged_scenes(plan, scenes_state)]
+    """One sentence -> DirectionPlan fanning out to every modality (clips, score, narration)."""
+    merged = _merged_scenes(plan, scenes_state)
+    scenes = [_brief_scene_view(sc) for sc in merged]
     context = {
         "campaign_name": plan.get("campaign_name"), "tagline": plan.get("tagline"),
         "brand": {k: (plan.get("brand") or {}).get(k) for k in ("name", "palette", "visual_style", "mood")},
-        "music": plan.get("music"), "scenes": scenes,
+        "music": plan.get("music"), "voice": plan.get("voice"), "scenes": scenes,
+        "voiceover_word_budget": mockgen.vo_word_budget(settings.video_seconds),
     }
     parts = [f"CURRENT AD:\n{json.dumps(context, ensure_ascii=False)}",
              f"CLIENT DIRECTION (one sentence for the whole ad): {instruction.strip()}",
@@ -625,7 +751,7 @@ async def plan_direction(gm: GenMedia, *, plan: dict, scenes_state: list[dict],
     ctx = {"kind": "direction", "plan": plan, "scenes_state": scenes, "instruction": instruction}
     raw, res = await gm.generate_json(parts, DIRECTION_SCHEMA, system=DIRECTION_SYSTEM, temperature=0.6,
                                       mock_context=ctx)
-    return normalize_direction(raw, plan, instruction), res
+    return normalize_direction(raw, plan, instruction, merged), res
 
 
 async def interpret_clip_edit(gm: GenMedia, *, plan: dict, scene: dict, instruction: str) -> tuple[dict, GenResult]:
@@ -642,11 +768,13 @@ async def interpret_clip_edit(gm: GenMedia, *, plan: dict, scene: dict, instruct
 
 
 async def localize_plan(gm: GenMedia, *, plan: dict, market: str) -> tuple[dict, GenResult]:
-    """Plan + market (e.g. "Hyderabad · Telugu") -> LocalizePlan."""
-    scenes = [{k: sc.get(k) for k in ("id", "title", "beat", "on_screen_text", "image_prompt")}
+    """Plan + market (e.g. "Hyderabad · Telugu") -> LocalizePlan (incl. native-script narration)."""
+    scenes = [{**{k: sc.get(k) for k in ("id", "title", "beat", "on_screen_text", "image_prompt")},
+               "voiceover": vo_text(sc.get("voiceover"))}
               for sc in plan.get("scenes") or []]
     context = {"campaign_name": plan.get("campaign_name"), "tagline": plan.get("tagline"), "cta": plan.get("cta"),
-               "brand": plan.get("brand"), "music": plan.get("music"), "scenes": scenes}
+               "brand": plan.get("brand"), "music": plan.get("music"), "voice": plan.get("voice"),
+               "scenes": scenes}
     parts = [f"ORIGINAL AD:\n{json.dumps(context, ensure_ascii=False)}",
              f"TARGET MARKET: {market}",
              "Return the LocalizePlan JSON."]

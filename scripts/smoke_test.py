@@ -5,7 +5,7 @@ Probes every GenMedia model AdLoop depends on, in pipeline order, and reports
 which API path actually worked for each one. The model ids are new preview ids,
 so the printed output is how we learn the real API shape:
 
-    text JSON  ->  image  ->  image w/ ref (continuity)  ->  music
+    text JSON  ->  image  ->  image w/ ref (continuity)  ->  music  ->  tts
                ->  video (image_to_video from the generated image)
                ->  edit turn 1 + turn 2 (multi-turn conversational edit)
                ->  transcribe
@@ -32,6 +32,7 @@ Examples::
     .venv/bin/python scripts/smoke_test.py --only image,video --aspect 9:16
     .venv/bin/python scripts/smoke_test.py --only transcribe --audio brief.webm
     .venv/bin/python scripts/smoke_test.py --raw --only image
+    .venv/bin/python scripts/smoke_test.py --only tts,transcribe  # speech round trip
 """
 from __future__ import annotations
 
@@ -57,7 +58,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-STEPS = ("text", "image", "music", "video", "edit", "transcribe")
+STEPS = ("text", "image", "music", "tts", "video", "edit", "transcribe")
 
 # Contract defaults (CONTRACT section 1). Only used by --raw, which must work even
 # if app/ is broken; the GenMedia path reads the ids from app.config.settings.
@@ -67,6 +68,7 @@ DEFAULT_MODELS = {
     "video": ("ADLOOP_MODEL_VIDEO", "gemini-omni-1.1-flash"),
     "music": ("ADLOOP_MODEL_MUSIC", "lyria-3.5"),
     "transcribe": ("ADLOOP_MODEL_TRANSCRIBE", "gemini-3.5-transcribe"),
+    "tts": ("ADLOOP_MODEL_TTS", "gemini-3.8-flash-tts"),
 }
 
 # Small fixed creative inputs so runs are comparable across days.
@@ -101,6 +103,9 @@ VIDEO_PROMPT = (
     "Slow push-in on the chai glass, steam curling upward, dust motes in the "
     "light, subtle handheld drift. Keep the keyframe's product and composition."
 )
+TTS_LINE = "Slow-brewed for hours, creamy and saffron-sweet. Your table is waiting at Irani Chai House."
+TTS_VOICE = "Kore"
+TTS_STYLE = "warm, confident, upbeat narrator"
 EDIT_TURNS = (
     "Make it golden hour: warmer, lower sun, longer shadows.",
     "Now add gentle rain on the window behind the table; keep everything else.",
@@ -151,6 +156,35 @@ def synth_wav(seconds: float = 3.0, rate: int = 16000) -> bytes:
             frames += struct.pack("<h", int(12000 * env * math.sin(2 * math.pi * f * t)))
         w.writeframes(bytes(frames))
     return buf.getvalue()
+
+
+def pcm_to_wav(pcm: bytes, mime: str | None) -> bytes:
+    """Wrap raw 16-bit mono PCM (``audio/L16;codec=pcm;rate=24000``) in a WAV header.
+
+    Kept local (like :func:`ext_for_mime`) so ``--raw`` works even if app/ is broken.
+    Payloads that already are WAV/MP3 are returned unchanged."""
+    if pcm[:4] == b"RIFF" or pcm[:3] == b"ID3" or pcm[:2] in (b"\xff\xfb", b"\xff\xf3"):
+        return pcm
+    rate = 24000
+    for param in (mime or "").split(";"):
+        if param.strip().startswith("rate="):
+            rate = int(param.strip()[5:] or rate)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def wav_seconds(data: bytes | None) -> float | None:
+    """Duration of a WAV payload (None if it is not a readable WAV)."""
+    try:
+        with wave.open(io.BytesIO(data or b"")) as w:
+            return round(w.getnframes() / float(w.getframerate()), 2)
+    except (wave.Error, EOFError, ZeroDivisionError):
+        return None
 
 
 def truncate(obj: Any, limit: int = 160) -> Any:
@@ -316,6 +350,15 @@ async def run_genmedia(args: argparse.Namespace, h: Harness, steps: list[str]) -
                        file=h.save("04_music", res.data, res.mime_type))
         await h.step("music", settings.model_music, music)
 
+    if "tts" in steps:
+        async def tts() -> Row:
+            res = await gm.generate_speech(TTS_LINE, voice=TTS_VOICE, style=TTS_STYLE)
+            ctx["speech"] = (res.data, res.mime_type)
+            print(f"    voice={TTS_VOICE}  mime={res.mime_type}  wav_seconds={wav_seconds(res.data)}")
+            return Row("tts", res.model, res.api_path, res.latency_ms, len(res.data or b""),
+                       file=h.save("04b_tts", res.data, res.mime_type))
+        await h.step("tts", settings.model_tts, tts)
+
     if "video" in steps:
         async def video() -> Row:
             res = await gm.generate_video(VIDEO_PROMPT, image=ctx.get("image"), aspect=args.aspect,
@@ -348,8 +391,10 @@ async def run_genmedia(args: argparse.Namespace, h: Harness, steps: list[str]) -
 
     if "transcribe" in steps:
         async def transcribe() -> Row:
-            audio = load_audio(args.audio) or ctx.get("music") or (synth_wav(), "audio/wav")
-            if not args.audio:
+            audio = load_audio(args.audio) or ctx.get("speech") or ctx.get("music") or (synth_wav(), "audio/wav")
+            if args.audio is None and "speech" in ctx:
+                print(f"    note: transcribing the tts output; expect ~{TTS_LINE!r}")
+            elif args.audio is None:
                 print("    note: no --audio given; using non-speech audio (tests the request path only)")
             data, mime = audio
             res = await gm.transcribe(data, mime)
@@ -372,8 +417,8 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
 
-def _decode(content: Any) -> tuple[bytes | None, str | None]:
-    """Pull bytes out of an interactions content object (inline base64 only)."""
+async def _decode(client: Any, content: Any) -> tuple[bytes | None, str | None]:
+    """Pull bytes out of an interactions content object (inline base64, else download its ``uri``)."""
     if content is None:
         return None, None
     data = getattr(content, "data", None)
@@ -387,7 +432,11 @@ def _decode(content: Any) -> tuple[bytes | None, str | None]:
         return bytes(data), mime
     uri = getattr(content, "uri", None)
     if uri:
-        print(f"    output delivered by uri: {uri} (download with header x-goog-api-key)")
+        print(f"    output delivered by uri: {uri}; downloading via files.download", flush=True)
+        try:
+            return await client.aio.files.download(file=uri), mime
+        except Exception as exc:  # noqa: BLE001 - report and keep the probe row
+            print(f"    uri download failed: {short_error(exc, 200)}")
     return None, mime
 
 
@@ -418,7 +467,7 @@ async def run_raw(args: argparse.Namespace, h: Harness, steps: list[str]) -> Non
     print(f"RAW SDK mode  out={h.out_dir}\nmodels: {json.dumps(model)}")
 
     async def interact(**kw: Any) -> Any:
-        """interactions.create + poll get() until terminal (for background jobs)."""
+        """interactions.create + poll get() until terminal (a queued reply must not read as empty)."""
         inter = await client.aio.interactions.create(**kw)
         t0 = time.perf_counter()
         while getattr(inter, "status", "completed") not in VIDEO_TERMINAL:
@@ -430,20 +479,26 @@ async def run_raw(args: argparse.Namespace, h: Harness, steps: list[str]) -> Non
         return inter
 
     async def timed(role: str, mdl: str, api: str, name: str, call: Callable[[], Awaitable[Any]],
-                    extract: Callable[[Any], tuple[bytes | None, str | None]], key_: str | None = None) -> None:
+                    extract: Callable[[Any], Any], key_: str | None = None) -> None:
+        """Run one raw probe; ``extract`` maps the response to ``(bytes, mime)`` (may be async)."""
         async def probe() -> Row:
             t0 = time.perf_counter()
             resp = await call()
             ms = int((time.perf_counter() - t0) * 1000)
             print("    raw response:\n" + "\n".join("      " + ln for ln in dump(resp).splitlines()))
-            data, mime = extract(resp)
-            if key_ and data:
-                ctx[key_] = (data, mime, resp)
+            out = extract(resp)
+            data, mime = (await out) if asyncio.iscoroutine(out) else out
+            # A video without fetchable bytes still has an id the edit chain can build on.
+            if key_ and (data or (key_ == "video" and getattr(resp, "id", None))):
+                ctx[key_] = (data or b"", mime, resp)
             return Row(role, mdl, api, ms, len(data or b""), file=h.save(name, data, mime))
         await h.step(f"{role} [{api}]", mdl, probe, api_path=api)
 
     def inter_text(r: Any) -> tuple[bytes | None, str | None]:
         return (getattr(r, "output_text", None) or "").encode() or None, "text/plain"
+
+    def inter_media(kind: str) -> Callable[[Any], Awaitable[tuple[bytes | None, str | None]]]:
+        return lambda r: _decode(client, getattr(r, f"output_{kind}", None))
 
     if "text" in steps:
         await timed("text/json", model["text"], "generate_content", "01_text_gc",
@@ -453,9 +508,9 @@ async def run_raw(args: argparse.Namespace, h: Harness, steps: list[str]) -> Non
                                                            response_json_schema=TEXT_SCHEMA)),
                     lambda r: ((r.text or "").encode() or None, "application/json"))
         await timed("text/json", model["text"], "interactions", "01_text_int",
-                    lambda: client.aio.interactions.create(
-                        model=model["text"], input=TEXT_PROMPT, response_mime_type="application/json",
-                        response_format=TEXT_SCHEMA),
+                    lambda: interact(
+                        model=model["text"], input=TEXT_PROMPT,
+                        response_format={"type": "text", "mime_type": "application/json", "schema": TEXT_SCHEMA}),
                     inter_text)
 
     if "image" in steps:
@@ -467,23 +522,50 @@ async def run_raw(args: argparse.Namespace, h: Harness, steps: list[str]) -> Non
                             image_config=types.ImageConfig(aspect_ratio=args.aspect, image_size=args.size))),
                     _gc_media, key_="image")
         await timed("image", model["image"], "interactions", "02_image_int",
-                    lambda: client.aio.interactions.create(
+                    lambda: interact(
                         model=model["image"], input=IMAGE_PROMPT, response_modalities=["image"],
                         response_format={"type": "image", "aspect_ratio": args.aspect,
                                          "image_size": args.size, "delivery": "inline"}),
-                    lambda r: _decode(getattr(r, "output_image", None)), key_="image")
+                    inter_media("image"), key_="image")
 
     if "music" in steps:
         await timed("music", model["music"], "interactions", "04_music_int",
                     lambda: interact(
                         model=model["music"], input=MUSIC_PROMPT, response_modalities=["audio"],
                         response_format={"type": "audio", "mime_type": "audio/mp3", "delivery": "inline"}),
-                    lambda r: _decode(getattr(r, "output_audio", None)), key_="music")
+                    inter_media("audio"), key_="music")
         await timed("music", model["music"], "generate_content", "04_music_gc",
                     lambda: client.aio.models.generate_content(
                         model=model["music"], contents=MUSIC_PROMPT,
                         config=types.GenerateContentConfig(response_modalities=["AUDIO"])),
                     _gc_media, key_="music")
+
+    if "tts" in steps:
+        prompt = f"Say in a {TTS_STYLE} voice: {TTS_LINE}"
+
+        def speech(r_media: tuple[bytes | None, str | None]) -> tuple[bytes | None, str | None]:
+            data, mime = r_media
+            print(f"    tts mime={mime}")
+            return (pcm_to_wav(data, mime), "audio/wav") if data else (None, mime)
+
+        async def inter_speech(r: Any) -> tuple[bytes | None, str | None]:
+            return speech(await _decode(client, getattr(r, "output_audio", None)))
+
+        await timed("tts", model["tts"], "generate_content", "04b_tts_gc",
+                    lambda: client.aio.models.generate_content(
+                        model=model["tts"], contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["AUDIO"],
+                            speech_config=types.SpeechConfig(
+                                voice_config=types.VoiceConfig(
+                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=TTS_VOICE)),
+                                language_code="en-US"))),
+                    lambda r: speech(_gc_media(r)), key_="speech")
+        await timed("tts", model["tts"], "interactions", "04b_tts_int",
+                    lambda: interact(
+                        model=model["tts"], input=prompt, response_modalities=["audio"],
+                        generation_config={"speech_config": [{"voice": TTS_VOICE, "language": "en-US"}]}),
+                    inter_speech, key_="speech")
 
     if "video" in steps:
         image = ctx.get("image", (None, None, None))
@@ -495,10 +577,10 @@ async def run_raw(args: argparse.Namespace, h: Harness, steps: list[str]) -> Non
                     lambda: interact(
                         model=model["video"], input=vinput, response_modalities=["video"],
                         response_format={"type": "video", "aspect_ratio": args.aspect, "resolution": "720p",
-                                         "duration": str(args.video_seconds), "delivery": "inline"},
+                                         "duration": f"{args.video_seconds}s", "delivery": "inline"},
                         generation_config={"video_config": {"task": "image_to_video" if image[0] else "text_to_video"}},
                         background=True, store=True),
-                    lambda r: _decode(getattr(r, "output_video", None)), key_="video")
+                    inter_media("video"), key_="video")
 
         async def legacy_video() -> Any:
             src = types.GenerateVideosSource(
@@ -546,7 +628,7 @@ async def run_raw(args: argparse.Namespace, h: Harness, steps: list[str]) -> Non
                             response_format={"type": "video", "aspect_ratio": args.aspect, "delivery": "inline"},
                             generation_config={"video_config": {"task": "edit"}},
                             background=True, store=True),
-                        lambda r: _decode(getattr(r, "output_video", None)), key_="video")
+                        inter_media("video"), key_="video")
             prev = ctx.get("video")
             new_id = getattr(prev[2], "id", None) if prev else None
             if new_id == prev_id:
@@ -556,12 +638,14 @@ async def run_raw(args: argparse.Namespace, h: Harness, steps: list[str]) -> Non
     if "transcribe" in steps:
         audio = load_audio(args.audio)
         if audio is None:
-            m = ctx.get("music")
+            m = ctx.get("speech") or ctx.get("music")
             audio = (m[0], m[1]) if m else (synth_wav(), "audio/wav")
-            print("\nnote: no --audio given; using non-speech audio (tests the request path only)")
+            print("\nnote: no --audio given; " + (f"transcribing the tts output (expect ~{TTS_LINE!r})"
+                                                  if "speech" in ctx else
+                                                  "using non-speech audio (tests the request path only)"))
         data, mime = audio
         await timed("transcribe", model["transcribe"], "interactions", "07_transcript_int",
-                    lambda: client.aio.interactions.create(
+                    lambda: interact(
                         model=model["transcribe"],
                         input=[{"type": "audio", "data": _b64(data), "mime_type": mime}],
                         response_modalities=["text"],

@@ -7,9 +7,12 @@ localization — without any network. This module provides:
 * JSON builders keyed off the brief (:func:`fake_plan`, :func:`fake_judgement`,
   :func:`fake_direction`, :func:`fake_clip_edit`, :func:`fake_localize`) and the
   dispatcher :func:`build_json` used by ``GenMedia.generate_json`` in mock mode.
+  Plans carry a narrator ``voice`` and per-scene ``voiceover`` lines written as
+  real ad copy (hook -> desire -> product reveal -> CTA with the brand name).
 * Media synthesis: :func:`render_image` (Pillow keyframes in the plan palette,
-  visually distinct per variant), :func:`tint_image` (a visible "edit"), and
-  :func:`synth_music` (pure-python chord-progression WAV, 44.1 kHz mono 16-bit).
+  visually distinct per variant), :func:`tint_image` (a visible "edit"),
+  :func:`synth_music` (pure-python chord-progression WAV, 44.1 kHz mono 16-bit)
+  and :func:`synth_speech` (speech-like narration WAV, 24 kHz mono 16-bit).
 
 Everything is deterministic for a given input (hash-seeded), except the judge,
 which deliberately scores scene ``s2`` below threshold on its first round so the
@@ -49,6 +52,13 @@ _THEMES: list[dict[str, Any]] = [
                    "cta": "Your Table Is Waiting"},
         "tagline": "Every sip, a homecoming.",
         "cta": "Visit us today",
+        "voice": {"name": "Charon", "style": "warm, nostalgic storyteller, unhurried and smiling"},
+        "vo": {"hook": "What if the best part of your morning fit in one small glass?",
+               "build": ["The Old City wakes slowly: steam, chatter, and that familiar saffron warmth.",
+                         "Every table here has a story, and every story starts with chai.",
+                         "Old friends, new faces, one long table under the ceiling fans."],
+               "reveal": "Slow-brewed for hours, creamy and saffron-sweet, with Osmania biscuits baked fresh daily.",
+               "cta": "Every sip, a homecoming. Visit {brand} today."},
         "music": {"genre": "cinematic Indian lo-fi with sitar and warm Rhodes", "bpm": 88, "key": "D major",
                   "instruments": ["sitar", "Rhodes piano", "tabla", "soft strings", "shaker"]},
     },
@@ -64,6 +74,13 @@ _THEMES: list[dict[str, Any]] = [
                    "cta": "Ride the Future"},
         "tagline": "Silent. Swift. Yours.",
         "cta": "Book a test ride",
+        "voice": {"name": "Puck", "style": "upbeat, confident Gen-Z energy, crisp and punchy"},
+        "vo": {"hook": "Stuck in traffic again, watching your whole morning crawl past?",
+               "build": ["Imagine slipping through the city: no fumes, no noise, just flow.",
+                         "Every shortcut opens up when your ride moves the way you do.",
+                         "No petrol queues, no parking stress. Just you and the open lane."],
+               "reveal": "A hundred and twenty kilometres per charge, instant torque, and a two-hour full charge.",
+               "cta": "Silent. Swift. Yours. Book a test ride with {brand}."},
         "music": {"genre": "future-bass electronic", "bpm": 118, "key": "F minor",
                   "instruments": ["analog synth bass", "plucked synths", "808 drums", "vocal chops (wordless)"]},
     },
@@ -79,6 +96,13 @@ _THEMES: list[dict[str, Any]] = [
                    "cta": "Own the Monsoon"},
         "tagline": "Made for the downpour.",
         "cta": "Shop the drop",
+        "voice": {"name": "Fenrir", "style": "bold, low and rhythmic street-style swagger"},
+        "vo": {"hook": "Monsoon's here. Are your sneakers actually ready for it?",
+               "build": ["Puddles, downpours, late-night streets. The city never stops for rain.",
+                         "Every splash is a beat. Every step, a statement.",
+                         "Soaked socks and slippery soles? Not tonight, not anymore."],
+               "reveal": "Fully waterproof uppers and a gum sole that grips on the wettest streets.",
+               "cta": "Made for the downpour. Shop the drop at {brand}."},
         "music": {"genre": "dark hip-hop with rain textures", "bpm": 92, "key": "A minor",
                   "instruments": ["sub bass", "trap hats", "piano stabs", "rain foley pads"]},
     },
@@ -95,6 +119,13 @@ _DEFAULT_THEME: dict[str, Any] = {
                "cta": "Make It Yours"},
     "tagline": "Made for moments that matter.",
     "cta": "Discover more",
+    "voice": {"name": "Kore", "style": "warm, confident, upbeat narrator"},
+    "vo": {"hook": "What if one small change made every single day feel lighter?",
+           "build": ["You know the moment: rushed, crowded, just a little too much.",
+                     "There is a better way to move through all of it.",
+                     "Less friction, more of the moments you actually care about."],
+           "reveal": "Meet {brand}: thoughtfully designed, beautifully made, and effortless every single day.",
+           "cta": "Made for moments that matter. Discover more at {brand}."},
     "music": {"genre": "uplifting cinematic pop", "bpm": 104, "key": "C major",
               "instruments": ["piano", "strings", "claps", "warm synth pad"]},
 }
@@ -112,6 +143,33 @@ def beats_for(n: int) -> list[str]:
     if n == 3:
         return ["hook", "reveal", "cta"]
     return ["hook"] + ["build"] * (n - 3) + ["reveal", "cta"]
+
+
+#: Narration pace used for word budgets and mock speech length (words per second).
+VO_WORDS_PER_SECOND = 2.4
+
+
+def vo_word_budget(duration_s: float) -> int:
+    """Maximum voiceover words that fit a scene: ``floor(duration_s * 2.4)`` (CONTRACT §9b)."""
+    return max(3, int(math.floor(float(duration_s) * VO_WORDS_PER_SECOND)))
+
+
+def fake_voiceover(brief: str, beats: list[str], brand: str) -> list[str]:
+    """Narration lines for ``beats`` (hook -> build(s) -> reveal -> cta naming ``brand``)."""
+    vo = _theme(brief)["vo"]
+    lines, build_i = [], 0
+    for beat in beats:
+        if beat == "build":
+            lines.append(vo["build"][build_i % len(vo["build"])])
+            build_i += 1
+        else:
+            lines.append(vo[beat].format(brand=brand))
+    return lines
+
+
+def fake_voice(brief: str) -> dict:
+    """The narrator voice (prebuilt voice name + delivery style) that suits the brief's theme."""
+    return dict(_theme(brief)["voice"])
 
 
 def _theme(brief: str) -> dict[str, Any]:
@@ -148,6 +206,7 @@ def fake_plan(*, brief: str, brand: str = "", aspect: str = "16:9", n_scenes: in
         "tall 9:16 frame, subject centered in the upper two-thirds"
     scenes = []
     build_i = 0
+    lines = fake_voiceover(brief, beats, name)
     for i, beat in enumerate(beats):
         title = theme["titles"][beat]
         if beat == "build" and build_i > 0:
@@ -168,6 +227,7 @@ def fake_plan(*, brief: str, brand: str = "", aspect: str = "16:9", n_scenes: in
             "mood": theme["mood"].split(",")[min(i, 2) % 3].strip() or theme["mood"],
             "energy": energies[i],
             "on_screen_text": text,
+            "voiceover": lines[i],
         })
     return {
         "campaign_name": f"{name} — {theme['titles']['reveal']}",
@@ -187,6 +247,7 @@ def fake_plan(*, brief: str, brand: str = "", aspect: str = "16:9", n_scenes: in
         "scenes": scenes,
         "music": {**theme["music"], "arc": "sparse intrigue -> rhythmic build -> full-bodied reveal -> "
                                            "resolved brand sting"},
+        "voice": fake_voice(brief),
     }
 
 
@@ -267,13 +328,37 @@ def _mood_for(instruction: str) -> tuple[str, float] | None:
     return None
 
 
+#: Tone words that re-voice the narration (visual-only notes such as "gentle rain" or
+#: "warm light" deliberately do not match, so they leave the voiceover alone).
+_VOICE_TONES = [
+    (r"playful|\bfun\b|funny|cheeky|quirky", "playful, bright and bouncy, with a smile in the voice"),
+    (r"serious|premium|luxur|elegant|classy", "calm, premium and assured, low and unhurried"),
+    (r"energetic|hype|punchy|exciting|\bepic\b|intense", "high-energy hype narrator, punchy and fast"),
+    (r"\bcalm|whisper|hushed|dreamy|soft(er)? voice", "soft, intimate and gentle, almost a whisper"),
+    (r"dramatic|trailer", "deep cinematic trailer voice, dramatic pauses"),
+    (r"friendly|nostalg|warmer voice", "warm, friendly storyteller"),
+]
+
+
+def _voice_tone(instruction: str) -> str | None:
+    text = (instruction or "").lower()
+    return next((style for pattern, style in _VOICE_TONES if re.search(pattern, text)), None)
+
+
+def vo_text(scene: dict) -> str:
+    """A scene's narration line whether stored as a plan string or a run-state ``{"text": ...}`` dict."""
+    vo = scene.get("voiceover")
+    return str(vo.get("text") or "") if isinstance(vo, dict) else str(vo or "")
+
+
 def fake_direction(*, plan: dict | None = None, instruction: str = "", scenes_state: list | None = None,
                    **_: Any) -> dict:
-    """One sentence -> an Omni edit for every scene + a music re-score (+ mood updates)."""
+    """One sentence -> an Omni edit for every scene + a music re-score (+ mood and voice updates)."""
     plan = plan or {}
     scenes = scenes_state or plan.get("scenes") or []
     instr = (instruction or "").strip().rstrip(".") or "make it more cinematic"
     mood = _mood_for(instr)
+    tone = _voice_tone(instr)
     edits, moods = [], []
     for sc in scenes:
         sid = sc.get("id")
@@ -291,6 +376,10 @@ def fake_direction(*, plan: dict | None = None, instruction: str = "", scenes_st
         "restyle_keyframes": bool(re.search(r"restyle|palette|colou?r grade|look", instr.lower())),
         "music": {"rescore": True, "instruction": f"Re-score to feel {mood[0] if mood else instr}."},
         "mood_updates": moods,
+        # A tone note re-voices every line with the new delivery (same words).
+        "voiceover_updates": [{"scene_id": sc["id"], "text": vo_text(sc)} for sc in scenes
+                              if tone and sc.get("id") and vo_text(sc)],
+        "voice_style": tone or "",
     }
 
 
@@ -307,14 +396,34 @@ def fake_clip_edit(*, scene: dict | None = None, instruction: str = "", **_: Any
     }
 
 
-_LANGS: dict[str, dict[str, str]] = {
+_LANGS: dict[str, dict[str, Any]] = {
     "telugu": {"cta": "ఇప్పుడే సందర్శించండి", "prefix": "ప్రతి క్షణం", "music": "Telugu folk percussion with "
-               "nadaswaram accents"},
-    "hindi": {"cta": "आज ही आइए", "prefix": "हर पल", "music": "Bollywood-lounge strings with dholak groove"},
-    "tamil": {"cta": "இன்றே வாருங்கள்", "prefix": "ஒவ்வொரு கணமும்", "music": "Carnatic violin over a kuthu beat"},
-    "japanese": {"cta": "今すぐチェック", "prefix": "毎日に", "music": "city-pop with koto flourishes"},
+               "nadaswaram accents",
+               "vo": {"hook": "ఒక చిన్న క్షణం మీ రోజును మార్చగలిగితే?",
+                      "build": "నగరం మేల్కొంటోంది, ఒక కొత్త అనుభూతితో.",
+                      "reveal": "అసలైన నాణ్యత, అద్భుతమైన అనుభవం, అన్నీ ఒకే చోట.",
+                      "cta": "{cta}, {brand}."}},
+    "hindi": {"cta": "आज ही आइए", "prefix": "हर पल", "music": "Bollywood-lounge strings with dholak groove",
+              "vo": {"hook": "क्या एक छोटा सा पल आपका दिन बदल सकता है?",
+                     "build": "शहर जाग रहा है, एक नए एहसास के साथ।",
+                     "reveal": "बेहतरीन क्वालिटी, शानदार अनुभव, सब कुछ एक साथ।",
+                     "cta": "{cta}, {brand}।"}},
+    "tamil": {"cta": "இன்றே வாருங்கள்", "prefix": "ஒவ்வொரு கணமும்", "music": "Carnatic violin over a kuthu beat",
+              "vo": {"hook": "ஒரு சிறிய தருணம் உங்கள் நாளை மாற்றினால்?",
+                     "build": "நகரம் விழிக்கிறது, ஒரு புதிய உணர்வுடன்.",
+                     "reveal": "சிறந்த தரம், அருமையான அனுபவம், எல்லாம் ஒரே இடத்தில்.",
+                     "cta": "{cta}, {brand}."}},
+    "japanese": {"cta": "今すぐチェック", "prefix": "毎日に", "music": "city-pop with koto flourishes",
+                 "vo": {"hook": "小さな瞬間が、毎日を変えるとしたら？",
+                        "build": "街が目覚める。新しい気分とともに。",
+                        "reveal": "確かな品質と、最高の体験をひとつに。",
+                        "cta": "{cta}。{brand}。"}},
     "english": {"cta": "", "prefix": "", "music": "polished indie-pop"},
-    "spanish": {"cta": "Descúbrelo hoy", "prefix": "Cada momento", "music": "Latin pop with nylon guitar"},
+    "spanish": {"cta": "Descúbrelo hoy", "prefix": "Cada momento", "music": "Latin pop with nylon guitar",
+                "vo": {"hook": "¿Y si un pequeño momento cambiara tu día?",
+                       "build": "La ciudad despierta con una energía nueva.",
+                       "reveal": "Calidad real y una experiencia increíble, todo en uno.",
+                       "cta": "{cta} con {brand}."}},
 }
 
 
@@ -326,20 +435,27 @@ def fake_localize(*, plan: dict | None = None, market: str = "", **_: Any) -> di
     table = _LANGS.get(lang.lower(), {"cta": plan.get("cta", ""), "prefix": "", "music": f"{lang} pop"})
     tagline = plan.get("tagline", "")
     loc_tagline = f"{table['prefix']} — {tagline}" if table["prefix"] else tagline
-    edits = []
+    cta = table["cta"] or plan.get("cta", "")
+    brand = (plan.get("brand") or {}).get("name", "")
+    edits, lines = [], []
     for sc in plan.get("scenes", []):
         text = sc.get("on_screen_text") or ""
         edits.append({"scene_id": sc.get("id"), "nb2_instruction":
                       (f"Re-render the on-image text in {lang} script" + (f" (was '{text}')" if text else "") +
                        f"; adapt the setting, wardrobe and props to {city}; keep composition, lighting, hero pose "
                        f"and the product exactly as they are.")})
+        vo = table.get("vo")
+        line = vo.get(sc.get("beat"), vo["build"]).format(cta=cta, brand=brand) if vo else vo_text(sc)
+        lines.append({"scene_id": sc.get("id"), "text": line})
     return {
         "market": market,
         "language": lang,
         "tagline": loc_tagline,
-        "cta": table["cta"] or plan.get("cta", ""),
+        "cta": cta,
         "scene_edits": edits,
         "music_style": table["music"],
+        "voiceover": lines,
+        "voice": (plan.get("voice") or {}).get("name") or "Kore",
     }
 
 
@@ -645,5 +761,106 @@ def synth_music(prompt: str, seconds: int) -> bytes:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Speech synthesis (pure python `wave`) — a stand-in for Gemini TTS narration
+# ─────────────────────────────────────────────────────────────────────────────
+
+SPEECH_RATE = 24000  #: Gemini TTS emits 24 kHz mono 16-bit PCM; the mock matches it.
+#: Mock speaking pace (words/second): a little faster than the 2.4 budget so lines fit their scene.
+SPEECH_WORDS_PER_SECOND = 2.6
+#: Base pitch (Hz) per prebuilt voice, so different narrators sound different.
+_VOICE_F0 = {"Kore": 205.0, "Aoede": 215.0, "Leda": 225.0, "Zephyr": 195.0,
+             "Puck": 135.0, "Charon": 110.0, "Fenrir": 100.0, "Orus": 120.0}
+#: (F1, F2) formant pairs for five cardinal vowels.
+_VOWELS = [(730.0, 1090.0), (270.0, 2290.0), (300.0, 870.0), (530.0, 1840.0), (570.0, 840.0)]
+
+
+def _syllables(word: str) -> int:
+    """Rough syllable count: vowel groups (at least one; CJK/Indic scripts count ~1 per 2 chars)."""
+    latin = re.findall(r"[aeiouy]+", word.lower())
+    if latin:
+        return len(latin)
+    letters = len(re.findall(r"\w", word))
+    return max(1, letters // 2)
+
+
+def _speech_timeline(text: str, total: int) -> list[tuple[int, int, int, bool]]:
+    """Syllable segments ``(start, length, vowel_idx, phrase_end)`` spread over ``total`` samples."""
+    words = text.split()
+    units: list[tuple[int, float, bool]] = []  # (syllables, pause after in seconds, ends a phrase)
+    for w in words:
+        end = w[-1] in ".!?;:—。！？।"
+        units.append((_syllables(w), 0.28 if end else (0.12 if w[-1] in ",、" else 0.05), end))
+    pause_total = sum(p for _, p, _ in units) * SPEECH_RATE
+    syl_total = max(1, sum(n for n, _, _ in units))
+    syl_len = max(int(0.09 * SPEECH_RATE), int((total - pause_total) / syl_total))
+    rng = random.Random(_h(text))
+    out, t = [], int(0.05 * SPEECH_RATE)
+    for n, pause, end in units:
+        for k in range(n):
+            length = int(syl_len * rng.uniform(0.8, 1.2))
+            out.append((t, length, rng.randrange(len(_VOWELS)), end and k == n - 1))
+            t += length
+        t += int(pause * SPEECH_RATE)
+    return out
+
+
+def synth_speech(text: str, voice: str = "Kore") -> bytes:
+    """Speech-like narration WAV (24 kHz mono 16-bit), about ``words / 2.6`` seconds long.
+
+    Each syllable is a voiced glottal tone shaped by a vowel's two formants under a
+    smooth amplitude envelope, with a pitch contour that declines across a phrase and
+    rises on questions — it reads as "someone talking" in demos, with no network.
+    """
+    words = max(1, len(text.split()))
+    seconds = max(0.8, words / SPEECH_WORDS_PER_SECOND)
+    total = int(seconds * SPEECH_RATE) + int(0.25 * SPEECH_RATE)
+    f0_base = _VOICE_F0.get(voice, 180.0)
+    question = text.rstrip().endswith(("?", "？"))
+    mix = [0.0] * total
+    rng = random.Random(_h(text, voice))
+    two_pi = 2 * math.pi
+    timeline = _speech_timeline(text, int(seconds * SPEECH_RATE))
+    last = len(timeline) - 1
+    for i, (start, length, vowel, phrase_end) in enumerate(timeline):
+        f1, f2 = _VOWELS[vowel]
+        # Pitch: gentle declination across the line, final rise on a question.
+        progress = i / max(1, last)
+        f0 = f0_base * (1.12 - 0.22 * progress) * rng.uniform(0.95, 1.05)
+        if question and i >= last - 1:
+            f0 *= 1.25
+        if phrase_end and not question:
+            f0 *= 0.9
+        harmonics = []
+        k = 1
+        while k * f0 < 3800 and k <= 24:
+            f = k * f0
+            gain = 1.0 / (1 + ((f - f1) / 110.0) ** 2) + 0.6 / (1 + ((f - f2) / 160.0) ** 2) + 0.02
+            harmonics.append((two_pi * f / SPEECH_RATE, gain / k ** 0.6))
+            k += 1
+        # Short consonant burst before the vowel for texture.
+        burst = int(0.018 * SPEECH_RATE)
+        for j in range(min(burst, total - start)):
+            mix[start + j] += 0.05 * rng.uniform(-1, 1) * (1 - j / burst)
+        for j in range(length):
+            idx = start + burst + j
+            if idx >= total:
+                break
+            env = math.sin(math.pi * j / length) ** 1.5
+            mix[idx] += env * sum(g * math.sin(inc * j) for inc, g in harmonics)
+    peak = max(1e-6, max(abs(v) for v in mix))
+    scale_to = 0.8 * 32767 / peak
+    pcm = array("h", (int(v * scale_to) for v in mix))
+    if sys.byteorder == "big":  # WAV is little-endian
+        pcm.byteswap()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SPEECH_RATE)
         wf.writeframes(pcm.tobytes())
     return buf.getvalue()

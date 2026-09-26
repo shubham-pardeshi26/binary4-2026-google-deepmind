@@ -225,24 +225,176 @@ async def ken_burns(image_bytes: bytes, seconds: int, aspect: str) -> bytes:
         return dst.read_bytes()
 
 
+# --------------------------------------------------------------------------- voiceover timeline
+#: Narration starts this long after its scene begins (lets the cut land before the voice does).
+VO_LEAD_IN_S = 0.25
+#: A line must end this long before its scene ends, otherwise it is sped up (up to VO_MAX_TEMPO).
+VO_TAIL_S = 0.3
+VO_MAX_TEMPO = 1.2
+#: Minimum silence kept between two consecutive lines when one spills into the next scene.
+VO_GAP_S = 0.1
+
+
+@dataclass
+class VoicePlacement:
+    """Where one scene's narration line sits in the final cut (seconds on the output timeline)."""
+
+    index: int          # scene / clip index the line belongs to
+    start: float        # output time the (possibly sped-up) line starts
+    end: float          # output time it ends
+    tempo: float        # atempo factor applied (1.0 = untouched)
+
+
+def place_voiceovers(scene_durs: list[float], fade_s: float,
+                     vo_durs: list[float | None]) -> list[VoicePlacement]:
+    """Lay narration lines out on the cut's timeline (pure function; also used to time the captions).
+
+    Scene ``i`` starts at ``sum(scene_durs[:i]) - i * fade_s`` (crossfades overlap consecutive clips). Each line
+    starts ``VO_LEAD_IN_S`` into its scene; if it is longer than its scene minus ``VO_TAIL_S`` it is sped up with
+    atempo (capped at ``VO_MAX_TEMPO``) and otherwise allowed to spill slightly. A spilled line pushes the next
+    one back so two lines never talk over each other.
+    """
+    n = len(scene_durs)
+    placements: list[VoicePlacement] = []
+    offset = 0.0
+    prev_end = 0.0
+    for i, d in enumerate(scene_durs):
+        seg = d - (fade_s if i < n - 1 else 0.0)
+        vd = vo_durs[i] if i < len(vo_durs) else None
+        if vd and vd > 0:
+            room = max(0.5, seg - VO_TAIL_S)
+            tempo = min(VO_MAX_TEMPO, vd / room) if vd > room else 1.0
+            start = max(offset + VO_LEAD_IN_S, prev_end + VO_GAP_S if placements else 0.0)
+            end = start + vd / tempo
+            placements.append(VoicePlacement(i, round(start, 3), round(end, 3), round(tempo, 4)))
+            prev_end = end
+        offset += seg
+    return placements
+
+
+def _vtt_time(seconds: float) -> str:
+    ms = int(round(max(0.0, seconds) * 1000))
+    h, rem = divmod(ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def write_vtt(path: Path, cues: list[tuple[float, float, str]]) -> Path:
+    """Atomically write a WebVTT captions file with one cue per ``(start_s, end_s, text)``."""
+    lines = ["WEBVTT", ""]
+    for i, (start, end, text) in enumerate(cues, start=1):
+        text = " ".join(str(text).split())
+        if not text:
+            continue
+        lines += [str(i), f"{_vtt_time(start)} --> {_vtt_time(end)}", text, ""]
+    path = Path(path)
+    return save_bytes(path.parent, path.name, "\n".join(lines).encode("utf-8"))
+
+
 # --------------------------------------------------------------------------- stitch
 def _keep_clip_audio() -> bool:
     return os.getenv("ADLOOP_KEEP_CLIP_AUDIO", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
-async def stitch(clips: list[Path], music: Path | None, out: Path, *, aspect: str,
-                 fade_s: float = 0.35) -> float:
-    """Concatenate ``clips`` into one H.264 MP4 at ``out`` with an optional soundtrack; return its duration.
+_AFMT = "aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo"
 
-    Robust to heterogeneous inputs: every clip is scaled-to-fit + padded to the target frame (1280x720 or
-    720x1280), resampled to 30fps / SAR 1 / yuv420p, and padded-then-trimmed to exactly its probed duration so
-    the crossfade offsets are exact even if a stream ends a few frames early. Consecutive clips are joined with
-    an ``xfade`` of ``fade_s`` seconds (hard ``concat`` if ``fade_s`` <= 0 or any clip is too short to fade).
 
-    Audio: the music track (if any) is loudness-normalised (EBU R128, -16 LUFS), padded/trimmed to the video
-    length and faded out over the final 1.2s. Clip audio is dropped unless ``ADLOOP_KEEP_CLIP_AUDIO=1``, in
-    which case it is mixed under the music at 0.35 (clips without an audio stream contribute silence). If
-    there is neither music nor kept clip audio, the output has no audio stream.
+def _silence(seconds: float) -> str:
+    return f"anullsrc=r=44100:cl=stereo,atrim=duration={seconds:.3f},{_AFMT}"
+
+
+def _audio_graph(*, n: int, durs: list[float], fade: float, total: float, infos: list[MediaInfo],
+                 keep_audio: bool, music_idx: int | None, vo_inputs: list[tuple[int, VoicePlacement]],
+                 duck: str) -> tuple[list[str], str | None]:
+    """Build the audio half of the filter graph; returns (filters, output label or None).
+
+    Buses: narration, music and optional clip audio. The narration bus is a gapless ``concat`` of
+    ``silence, line, silence, line, ..., silence`` (placements never overlap), each line loudness-normalised and
+    sped up if needed. Timestamps are regenerated from the sample count after every resampling filter
+    (``asetpts=N/SR/TB``): ``adelay``/``amix`` on loudnorm output mis-time streams in ffmpeg 7, so they are avoided.
+    With narration present the music is ducked under it -- ``duck="sidechain"`` uses a sidechain compressor keyed
+    on the narration bus, ``duck="volume"`` simply plays the music at 0.3 (fallback if the compressor fails).
+    """
+    fc: list[str] = []
+    beds: list[str] = []
+    if keep_audio:
+        for i, (d, info) in enumerate(zip(durs, infos)):
+            seg = d - (fade if i < n - 1 else 0.0)
+            src = f"[{i}:a:0]{_AFMT},apad," if info.has_audio else "anullsrc=r=44100:cl=stereo,"
+            fc.append(f"{src}atrim=duration={seg:.3f},asetpts=PTS-STARTPTS[ca{i}]")
+        fc.append("".join(f"[ca{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1,volume=0.35[clipa]")
+        beds.append("clipa")
+
+    vo_bus = None
+    if vo_inputs:
+        parts: list[str] = []
+        cursor = 0.0
+        for j, (inp, pl) in enumerate(vo_inputs):
+            start = min(pl.start, total)
+            length = max(0.0, min(pl.end, total) - start)
+            if length <= 0.05:
+                continue
+            if start - cursor > 0.001:
+                fc.append(f"{_silence(start - cursor)}[vg{j}]")
+                parts.append(f"[vg{j}]")
+            tempo = f"atempo={pl.tempo:.4f}," if pl.tempo > 1.001 else ""
+            fc.append(f"[{inp}:a:0]{_AFMT},loudnorm=I=-15:TP=-1.5:LRA=7,{_AFMT},asetpts=N/SR/TB,{tempo}"
+                      f"apad=whole_dur={length:.3f},atrim=duration={length:.3f},asetpts=N/SR/TB[vl{j}]")
+            parts.append(f"[vl{j}]")
+            cursor = start + length
+        if parts:
+            if total - cursor > 0.001:
+                fc.append(f"{_silence(total - cursor)}[vgend]")
+                parts.append("[vgend]")
+            fc.append("".join(parts) + f"concat=n={len(parts)}:v=0:a=1[vobus]")
+            vo_bus = "vobus"
+
+    if music_idx is not None:
+        fade_out = min(1.2, max(0.1, total / 4))
+        level = ",volume=0.3" if (vo_bus and duck == "volume") else ""
+        fc.append(
+            f"[{music_idx}:a:0]{_AFMT},loudnorm=I=-16:TP=-1.5:LRA=11,{_AFMT},asetpts=N/SR/TB,"
+            f"apad=whole_dur={total:.3f},atrim=duration={total:.3f},"
+            f"afade=t=out:st={max(0.0, total - fade_out):.3f}:d={fade_out:.3f}{level}[mus]"
+        )
+        if vo_bus and duck == "sidechain":
+            fc.append("[vobus]asplit=2[vomix][vokey]")
+            fc.append("[mus][vokey]sidechaincompress=threshold=0.03:ratio=6:attack=20:release=500:makeup=1[musd]")
+            beds.insert(0, "musd")
+            vo_bus = "vomix"
+        else:
+            beds.insert(0, "mus")
+    if vo_bus:
+        beds.append(vo_bus)
+
+    if not beds:
+        return fc, None
+    if len(beds) == 1:
+        fc.append(f"[{beds[0]}]alimiter=limit=0.95[aout]")
+    else:
+        fc.append("".join(f"[{b}]" for b in beds) +
+                  f"amix=inputs={len(beds)}:duration=first:normalize=0,alimiter=limit=0.95[aout]")
+    return fc, "aout"
+
+
+async def stitch(clips: list[Path], music: Path | None, out: Path, *, aspect: str, fade_s: float = 0.35,
+                 voiceovers: list[tuple[Path | None, float]] | None = None,
+                 captions: list[str] | None = None, captions_out: Path | None = None) -> float:
+    """Concatenate ``clips`` into one H.264 MP4 at ``out`` with soundtrack + narration; return its duration.
+
+    Video: every clip is scaled-to-fit + padded to the target frame (1280x720 or 720x1280), resampled to 30fps /
+    SAR 1 / yuv420p, and padded-then-trimmed to exactly its probed duration so the crossfade offsets are exact
+    even if a stream ends a few frames early. Consecutive clips are joined with an ``xfade`` of ``fade_s`` seconds
+    (hard ``concat`` if ``fade_s`` <= 0 or any clip is too short to fade).
+
+    Audio: the music (EBU R128 -16 LUFS, padded/trimmed to the cut, 1.2s fade-out) is ducked under the narration.
+    ``voiceovers`` is aligned with ``clips``: one ``(wav_path | None, duration_s)`` per scene (a missing line is
+    simply silent); lines are placed by :func:`place_voiceovers`. Clip audio is dropped unless
+    ``ADLOOP_KEEP_CLIP_AUDIO=1`` (then mixed at 0.35). No music, narration or clip audio -> no audio stream.
+
+    Captions: when ``captions_out`` is given, a WebVTT file with one cue per placed line (text from ``captions``,
+    aligned with ``clips``) is written next to the cut, timed exactly like the audio.
     """
     clips = [Path(c) for c in clips]
     if not clips:
@@ -261,18 +413,39 @@ async def stitch(clips: list[Path], music: Path | None, out: Path, *, aspect: st
         fade = 0.0
     total = sum(durs) - fade * (n - 1)
 
-    keep_audio = _keep_clip_audio()
-    music_ok = music is not None and Path(music).exists()
+    # Narration lines that actually exist on disk, with a probed duration when the caller did not know it.
+    vos = list(voiceovers or [])[:n]
+    vo_paths: list[Path | None] = []
+    vo_durs: list[float | None] = []
+    for item in vos:
+        path, dur = (item if isinstance(item, (tuple, list)) else (item, None))
+        path = Path(path) if path else None
+        if path is None or not path.exists():
+            vo_paths.append(None)
+            vo_durs.append(None)
+            continue
+        vo_paths.append(path)
+        vo_durs.append(float(dur) if dur else await probe_duration(path))
+    placements = place_voiceovers(durs, fade, vo_durs)
 
+    music_ok = music is not None and Path(music).exists()
     args: list[str] = []
     for c in clips:
         args += ["-i", str(c)]
+    music_idx = None
     if music_ok:
+        music_idx = n
         args += ["-i", str(music)]
+    vo_inputs: list[tuple[int, VoicePlacement]] = []
+    next_idx = n + (1 if music_ok else 0)
+    for pl in placements:
+        args += ["-i", str(vo_paths[pl.index])]
+        vo_inputs.append((next_idx, pl))
+        next_idx += 1
 
-    fc: list[str] = []
+    vfc: list[str] = []
     for i, d in enumerate(durs):
-        fc.append(
+        vfc.append(
             f"[{i}:v:0]scale={w}:{h}:force_original_aspect_ratio=decrease,"
             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={FPS},format=yuv420p,"
             f"tpad=stop_mode=clone:stop_duration=2,trim=duration={d:.3f},setpts=PTS-STARTPTS,"
@@ -280,59 +453,63 @@ async def stitch(clips: list[Path], music: Path | None, out: Path, *, aspect: st
             f"fps={FPS},settb=1/{FPS}[v{i}]"
         )
     if n == 1:
-        fc.append("[v0]null[vout]")
+        vfc.append("[v0]null[vout]")
     elif fade > 0:
         prev = "v0"
         offset = 0.0
         for i in range(1, n):
             offset += durs[i - 1] - fade
             label = "vout" if i == n - 1 else f"x{i}"
-            fc.append(f"[{prev}][v{i}]xfade=transition=fade:duration={fade:.3f}:offset={offset:.3f}[{label}]")
+            vfc.append(f"[{prev}][v{i}]xfade=transition=fade:duration={fade:.3f}:offset={offset:.3f}[{label}]")
             prev = label
     else:
-        fc.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vout]")
-
-    audio_labels: list[str] = []
-    afmt = "aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo"
-    if keep_audio:
-        for i, (d, info) in enumerate(zip(durs, infos)):
-            seg = d - (fade if i < n - 1 else 0.0)
-            if info.has_audio:
-                fc.append(f"[{i}:a:0]{afmt},apad,atrim=duration={seg:.3f},asetpts=PTS-STARTPTS[ca{i}]")
-            else:
-                fc.append(f"anullsrc=r=44100:cl=stereo,atrim=duration={seg:.3f},asetpts=PTS-STARTPTS[ca{i}]")
-        fc.append("".join(f"[ca{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1,volume=0.35[clipa]")
-        audio_labels.append("clipa")
-    if music_ok:
-        fade_out = min(1.2, max(0.1, total / 4))
-        fc.append(
-            f"[{n}:a:0]{afmt},loudnorm=I=-16:TP=-1.5:LRA=11,{afmt},apad,atrim=duration={total:.3f},"
-            f"afade=t=out:st={max(0.0, total - fade_out):.3f}:d={fade_out:.3f},asetpts=PTS-STARTPTS[mus]"
-        )
-        audio_labels.append("mus")
-    if len(audio_labels) == 2:
-        fc.append("[mus][clipa]amix=inputs=2:duration=first:normalize=0[aout]")
-        a_out = "aout"
-    elif audio_labels:
-        a_out = audio_labels[0]
-    else:
-        a_out = None
+        vfc.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vout]")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(f".{out.stem}.{uuid.uuid4().hex[:8]}.tmp.mp4")
-    args += ["-filter_complex", ";".join(fc), "-map", "[vout]"]
-    if a_out:
-        args += ["-map", f"[{a_out}]", "-c:a", "aac", "-b:a", "192k", "-ar", "44100"]
-    else:
-        args += ["-an"]
-    args += [
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-r", str(FPS),
-        "-t", f"{total:.3f}", "-movflags", "+faststart", str(tmp),
-    ]
+
+    async def encode(duck: str) -> None:
+        afc, a_out = _audio_graph(n=n, durs=durs, fade=fade, total=total, infos=infos,
+                                  keep_audio=_keep_clip_audio(), music_idx=music_idx, vo_inputs=vo_inputs,
+                                  duck=duck)
+        cmd = [*args, "-filter_complex", ";".join(vfc + afc), "-map", "[vout]"]
+        if a_out:
+            cmd += ["-map", f"[{a_out}]", "-c:a", "aac", "-b:a", "192k", "-ar", "44100"]
+        else:
+            cmd += ["-an"]
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-r", str(FPS),
+                "-t", f"{total:.3f}", "-movflags", "+faststart", str(tmp)]
+        await run_ffmpeg(cmd)
+
     try:
-        await run_ffmpeg(args)
+        try:
+            await encode("sidechain")
+        except MediaError as exc:
+            if not (vo_inputs and music_ok):
+                raise
+            log.warning("sidechain ducking failed (%s); retrying with fixed music level", exc)
+            await encode("volume")
         os.replace(tmp, out)
     finally:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
+
+    if captions_out is not None:
+        texts = list(captions or [])
+        cues = [(pl.start, min(pl.end, total), texts[pl.index] if pl.index < len(texts) else "")
+                for pl in placements]
+        await asyncio.to_thread(write_vtt, captions_out, cues)
     return await probe_duration(out)
+
+
+async def mean_volume_db(path: Path, start: float, duration: float) -> float | None:
+    """Mean loudness (dBFS, via ``volumedetect``) of ``path``'s audio in ``[start, start + duration]``.
+
+    Used by tests / diagnostics to prove narration is audible in the final cut. None if undetectable.
+    """
+    _, err = await _exec(["-hide_banner", "-nostdin", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+                          "-i", str(path), "-vn", "-af", "volumedetect", "-f", "null", "-"], timeout=60)
+    m = re.search(r"mean_volume:\s*(-?[\d.]+|-inf) dB", err)
+    if not m or m.group(1) == "-inf":
+        return None
+    return float(m.group(1))

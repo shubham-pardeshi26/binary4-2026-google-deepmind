@@ -19,7 +19,7 @@
  *   0. Constants          5. Render scheduler + helpers   10. Localize
  *   1. DOM utilities      6. Top bar / rail / plan         11. Director bar
  *   2. Formatting         7. Storyboard fan-out            12. Telemetry + event log
- *   3. API + toasts       8. Motion lab                    13. Brief panel + launch
+ *   3. API + toasts       8. Motion lab + voiceover        13. Brief panel + launch
  *   4. Store + stream     9. Soundtrack + final cut        14. Voice capture
  *                                                          15. Presentation mode
  *                                                          16. Boot
@@ -63,6 +63,9 @@ const MARKETS = ['Hyderabad · Telugu', 'Mumbai · Hindi', 'Chennai · Tamil', '
 /** Quick edit chips offered on every clip card (CONTRACT §8.6). */
 const CLIP_QUICK_EDITS = ['slower push-in', 'golden hour light', 'add gentle rain', 'orbit the product'];
 
+/** Backend stage names that belong to scene narration (TTS); the rail and timeline accept any of them. */
+const VOICE_STAGES = ['voiceover', 'voice', 'tts'];
+
 /**
  * Pipeline rail definition. Each node aggregates one or more backend `stage` names
  * (CONTRACT §6 events table) and shows live state + elapsed time.
@@ -73,6 +76,7 @@ const RAIL = [
   { key: 'judge', label: 'Judge', model: 'Flash vision', stages: ['judge'] },
   { key: 'motion', label: 'Motion', model: 'Omni Flash', stages: ['motion'] },
   { key: 'music', label: 'Score', model: 'Lyria 3.5', stages: ['music'] },
+  { key: 'voice', label: 'Voice', model: 'Flash TTS', stages: VOICE_STAGES },
   { key: 'final', label: 'Final cut', model: 'ffmpeg', stages: ['final'] },
   { key: 'localize', label: 'Localize', model: 'NB2 + Lyria', stages: ['localize'], optional: true },
 ];
@@ -81,7 +85,10 @@ const RAIL = [
 const REPAIR_VARIANTS = 2;
 
 /** Nominal concurrency caps used to scale the in-flight bars (mirror app/config.py defaults). */
-const INFLIGHT_CAPS = { image: 8, video: 4, music: 2, text: 6 };
+const INFLIGHT_CAPS = { image: 8, video: 4, music: 3, text: 6, tts: 6 };
+
+/** In-flight modalities, in display order, with their short telemetry labels. */
+const INFLIGHT_LABELS = { image: 'NB2', video: 'Omni', music: 'Lyria', text: 'Flash', tts: 'TTS' };
 
 /** Telemetry tiles: [metrics key, label, format]. */
 const TELEMETRY_TILES = [
@@ -99,7 +106,28 @@ const TELEMETRY_TILES = [
   ['video_p50_ms', 'Omni p50', 'ms'],
   ['video_edits', 'Omni edits', 'n'],
   ['music_versions', 'Lyria versions', 'n'],
+  ['voiceovers_generated', 'Voiceovers', 'n'],
+  ['tts_p50_ms', 'TTS p50', 'ms'],
 ];
+
+/** Human names for backend stages, used in error toasts ("S2 clip failed: …"). */
+const STAGE_NOUN = {
+  director: 'plan', anchor: 'anchor', storyboard: 'keyframes', judge: 'judge', motion: 'clip', music: 'soundtrack',
+  final: 'final cut', localize: 'localize', direct: 'direction', voiceover: 'voiceover', voice: 'voiceover', tts: 'voiceover',
+};
+
+/** Presentation timing: pause after narration ends, and the length of slides without narration. */
+const SLIDE_GAP_MS = 800;
+const SLIDE_TIMED_MS = 4000;
+
+/** Web fonts (attached at boot so they never block first paint; system fallbacks render meanwhile). */
+const FONTS_URL = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap';
+
+/** localStorage key for the telemetry drawer's open/closed choice (default: closed). */
+const TELE_KEY = 'adloop.telemetry';
+
+/** A manual scroll suppresses automatic scrolling for this long. */
+const MANUAL_SCROLL_GRACE_MS = 10000;
 
 const REPLAY_SPEED = 3;
 const LOG_MAX = 300;
@@ -355,10 +383,21 @@ async function act(label, fn, { button, success } = {}) {
   }
 }
 
-/** Slide-in toast. kind ∈ info | ok | warn | error. */
+/** Recently shown toast texts / error scopes → timestamp, for de-duplication. */
+const recentToasts = new Map();
+
+/** True (and records `key`) unless the same key was seen within `windowMs`. */
+function firstWithin(key, windowMs) {
+  const now = performance.now();
+  const last = recentToasts.get(key);
+  recentToasts.set(key, now);
+  return last == null || now - last > windowMs;
+}
+
+/** Slide-in toast. kind ∈ info | ok | warn | error. Identical messages within 3 s are shown once. */
 function toast(msg, kind = 'info', ms = 4200) {
   const host = $('#toasts');
-  if (!host) return;
+  if (!host || !firstWithin(`${kind}|${msg}`, 3000)) return;
   const el = h(
     'div',
     { class: `toast ${kind}`, role: kind === 'error' ? 'alert' : 'status' },
@@ -376,6 +415,21 @@ function toast(msg, kind = 'info', ms = 4200) {
     el.classList.add('out');
     setTimeout(() => el.remove(), 320);
   }
+}
+
+/**
+ * The single error-toast path for pipeline failures. The backend reports one failure as
+ * `stage error` + `error` + `log`; only `error` events call this, and a scope (stage + scene)
+ * toasts at most once per 4 s so a burst of failures never floods the stack.
+ */
+function notifyError(stage, rawMsg) {
+  const m = /^(s\d+):\s*(.*)$/is.exec(String(rawMsg || ''));
+  const sceneId = m ? m[1] : null;
+  const msg = (m ? m[2] : rawMsg) || 'failed';
+  if (!firstWithin(`err|${stage}|${sceneId || ''}`, 4000)) return;
+  const noun = STAGE_NOUN[stage] || stage || 'pipeline';
+  const who = sceneId && store.run ? `${sceneLabel(store.run, sceneId)} ` : '';
+  toast(`${who}${noun} failed: ${msg}`, 'error');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -405,20 +459,31 @@ function freshUi() {
     pendingRegen: {}, // scene_id → true until the next new round lands
     regenRounds: {}, // scene_id → Set(round) produced by a user regenerate
     pendingDirect: null, // instruction awaiting a `direction` event
+    directError: null, // last direction failure, shown in the fan-out row
     pendingMusic: false,
+    pendingVoice: {}, // scene_id → text sent for re-voicing, until the new take lands
     musicView: null, // chosen music version v (else latest)
     locMarkets: new Set(),
-    logCount: 0,
+    spans: [], // timeline spans {row, stage, start, end, status} built from `stage` events
+    openSpans: {}, // `${stage}|${key}` → open span
+    celebrated: false, // first-final banner shown for this run
+    celebratePending: false, // the final panel should autoplay + glow on its next render
+    flights: [], // scene ids whose fresh winner should fly to its clip card after the next render
+    autoScrolled: new Set(), // one-shot auto-scroll targets already used for this run
+    voiceSend: null, // {text, timer} while a spoken direction counts down to auto-submit
   };
 }
 
 function resetUi() {
   closeStream();
+  clearTimeout(ui.voiceSend?.timer);
   const keepMarkets = ui.locMarkets;
   ui = freshUi();
   ui.locMarkets = keepMarkets;
   const log = $('#event-log');
   if (log) log.replaceChildren();
+  const banner = $('#cut-banner');
+  if (banner) banner.hidden = true;
 }
 
 /** An empty run shell (used for fresh launches and for replay). */
@@ -439,7 +504,7 @@ function normalizeRun(raw) {
   r.scenes = Array.isArray(r.scenes) ? r.scenes.map(normalizeScene) : [];
   r.music = { status: 'idle', current: 0, error: null, versions: [], ...(r.music || {}) };
   if (!Array.isArray(r.music.versions)) r.music.versions = [];
-  r.final = { status: 'idle', url: null, duration_s: null, version: 0, ...(r.final || {}) };
+  r.final = { status: 'idle', url: null, duration_s: null, version: 0, captions_url: null, ...(r.final || {}) };
   r.directions = Array.isArray(r.directions) ? r.directions : [];
   r.localizations = r.localizations && typeof r.localizations === 'object' ? r.localizations : {};
   for (const [m, loc] of Object.entries(r.localizations)) r.localizations[m] = normalizeLoc(loc);
@@ -453,15 +518,30 @@ function normalizeScene(s) {
   sc.judge = Array.isArray(sc.judge) ? sc.judge : [];
   sc.clip = { status: 'idle', elapsed_ms: 0, error: null, current: 0, versions: [], ...(sc.clip || {}) };
   if (!Array.isArray(sc.clip.versions)) sc.clip.versions = [];
+  sc.voiceover = normalizeVoice(sc.voiceover);
   // Apply judge scores onto variants when the snapshot did not already do it.
   for (const j of sc.judge) applyScores(sc, j.scores);
   return sc;
 }
 
+/** Scene narration state (CONTRACT §9c). Accepts the plan's bare string line as well as the state object. */
+function normalizeVoice(vo) {
+  const base = { status: 'idle', v: 0, text: '', url: null, latency_ms: 0, duration_s: null, error: null };
+  if (typeof vo === 'string') return { ...base, text: vo };
+  return { ...base, ...(vo && typeof vo === 'object' ? vo : {}) };
+}
+
 function normalizeLoc(l) {
-  const loc = { status: '', plan: null, scenes: [], music_url: null, error: null, ...(l || {}) };
+  const loc = { status: '', plan: null, scenes: [], music_url: null, error: null, voiceover: [], video_url: null, captions_url: null, ...(l || {}) };
   if (!Array.isArray(loc.scenes)) loc.scenes = [];
+  if (!Array.isArray(loc.voiceover)) loc.voiceover = [];
   return loc;
+}
+
+/** Append a cache-busting token so a re-rendered asset reusing its file name is re-fetched. */
+function withBust(url, token) {
+  if (!url || token == null || token === '') return url;
+  return `${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(String(token))}`;
 }
 
 function ensureScene(run, sceneId) {
@@ -499,9 +579,16 @@ function upsertVariant(scene, v) {
     if (v.url) existing.error = null;
     return false;
   }
-  scene.variants.push({ score: null, ...v });
+  scene.variants.push({ score: null, error: null, ...v });
   scene.variants.sort((a, b) => a.idx - b.idx);
   return true;
+}
+
+/** Replace-or-append `item` in `list`, matching on `item[key]`. */
+function upsertBy(list, key, item) {
+  const i = list.findIndex((x) => x[key] === item[key]);
+  if (i >= 0) list[i] = item;
+  else list.push(item);
 }
 
 /** Insert a versioned item (clip / music) keyed by `v`; returns true if new. */
@@ -527,6 +614,8 @@ function applyPlan(run, plan) {
     for (const k of ['title', 'beat', 'duration_s', 'on_screen_text', 'camera']) if (ps[k] != null && ps[k] !== '') s[k] = ps[k];
     if (!s.mood && ps.mood) s.mood = ps.mood;
     if (ps.energy != null && s._energyLocked !== true) s.energy = ps.energy;
+    // The plan's narration line shows immediately; the TTS take replaces it when it lands.
+    if (typeof ps.voiceover === 'string' && !s.voiceover.text) s.voiceover.text = ps.voiceover;
     return s;
   });
   // Keep any scenes that events created but the plan did not list (defensive).
@@ -560,6 +649,45 @@ function applyStage(e) {
     else st.dones++;
     if (st.burstStart == null) st.burstStart = e.ms != null ? t - e.ms : t;
   }
+  recordSpan(name, key, e, t);
+  if (e.status !== 'error') return;
+  // Failures must release every "in progress" affordance tied to this stage.
+  if (name === 'storyboard' && e.scene_id) delete ui.pendingRegen[e.scene_id];
+  if (name === 'direct') {
+    ui.pendingDirect = null;
+    ui.directError = e.detail || 'direction failed';
+  }
+}
+
+/** Timeline row for a stage event: the scene for per-scene stages, else a shared lane. */
+function spanRow(name, e) {
+  if (e.scene_id) return e.scene_id;
+  if (name === 'music') return '_music';
+  if (VOICE_STAGES.includes(name)) return '_voice';
+  if (name === 'localize') return '_loc';
+  return '_plan';
+}
+
+/** Open / close a timeline span for the live waterfall (`renderGantt`). */
+function recordSpan(name, key, e, t) {
+  const id = `${name}|${key}`;
+  if (e.status === 'start') {
+    const span = { row: spanRow(name, e), stage: name, start: t, end: null, status: 'active' };
+    ui.openSpans[id] = span;
+    ui.spans.push(span);
+    return;
+  }
+  if (e.status !== 'done' && e.status !== 'error') return;
+  let span = ui.openSpans[id];
+  delete ui.openSpans[id];
+  if (!span) {
+    // A done without a start (e.g. history trimmed): reconstruct it from `ms` when possible.
+    if (e.ms == null) return;
+    span = { row: spanRow(name, e), stage: name, start: Math.max(0, t - Number(e.ms)), end: null, status: 'active' };
+    ui.spans.push(span);
+  }
+  span.end = t;
+  span.status = e.status;
 }
 
 /** Track per-clip live elapsed timers from clip_status events. */
@@ -648,14 +776,24 @@ const REDUCERS = {
     s.winner = e.idx;
     s._winnerBy = e.by || 'judge';
     s._pendingRepair = false;
+    if (isFresh(e) && e.by !== 'user') ui.flights.push(s.id);
   },
   clip_status(run, e) {
     const s = ensureScene(run, e.scene_id);
     s.clip.status = e.status || s.clip.status;
     if (e.elapsed_ms != null) s.clip.elapsed_ms = e.elapsed_ms;
     s.clip.error = e.status === 'error' ? e.error || 'render failed' : null;
+    // A failed edit on a clip that already has versions arrives as status "done" + error:
+    // keep the error visible and fail the oldest pending chat bubble instead of spinning forever.
+    if (e.error && e.status !== 'error') {
+      s.clip.lastError = e.error;
+      const p = (ui.pendingEdits[s.id] || []).find((x) => !x.failed);
+      if (p) {
+        Object.assign(p, { failed: true, error: e.error, failedAt: performance.now() });
+        setTimeout(markDirty, 8100);
+      }
+    }
     touchClipTimer(s.id, s.clip.status, e.elapsed_ms);
-    if (e.status === 'error' && isFresh(e)) toast(`Clip ${s.id}: ${s.clip.error}`, 'error');
   },
   clip(run, e) {
     const s = ensureScene(run, e.scene_id);
@@ -672,8 +810,28 @@ const REDUCERS = {
     s.clip.current = e.v;
     s.clip.status = 'done';
     s.clip.error = null;
+    s.clip.lastError = null;
     touchClipTimer(s.id, 'done');
     if (isNew) delete ui.clipView[s.id];
+  },
+  voiceover_status(run, e) {
+    const vo = ensureScene(run, e.scene_id).voiceover;
+    vo.status = e.status || vo.status;
+    vo.error = e.status === 'error' ? e.error || 'narration failed' : null;
+    if (e.status === 'error') delete ui.pendingVoice[e.scene_id];
+  },
+  voiceover(run, e) {
+    const s = ensureScene(run, e.scene_id);
+    Object.assign(s.voiceover, {
+      status: 'done',
+      v: e.v ?? s.voiceover.v,
+      text: e.text ?? s.voiceover.text,
+      url: e.url || s.voiceover.url,
+      latency_ms: e.latency_ms,
+      duration_s: e.duration_s ?? null,
+      error: null,
+    });
+    delete ui.pendingVoice[s.id];
   },
   scene_update(run, e) {
     const s = ensureScene(run, e.scene_id);
@@ -682,13 +840,13 @@ const REDUCERS = {
       s.energy = e.energy;
       s._energyLocked = true;
     }
+    s._pulseAt = e.seq ?? e.t; // the mood-timeline segment pulses once per update
   },
   music_status(run, e) {
     run.music.status = e.status || run.music.status;
     run.music.error = e.status === 'error' ? e.error || 'score failed' : null;
     if (e.reason) run.music._reason = e.reason;
     if (e.status !== 'rendering') ui.pendingMusic = false;
-    if (e.status === 'error' && isFresh(e)) toast(`Soundtrack: ${run.music.error}`, 'error');
   },
   music(run, e) {
     const isNew = upsertVersion(run.music.versions, { v: e.v, url: e.url, prompt: e.prompt, latency_ms: e.latency_ms, reason: e.reason });
@@ -701,53 +859,75 @@ const REDUCERS = {
   final_status(run, e) {
     run.final.status = e.status || run.final.status;
     run.final.error = e.status === 'error' ? e.error || 'stitch failed' : null;
-    if (e.status === 'error' && isFresh(e)) toast(`Final cut: ${run.final.error}`, 'error');
   },
   final(run, e) {
     const isNew = (e.version ?? 0) !== run.final.version || e.url !== run.final.url;
-    Object.assign(run.final, { url: e.url, duration_s: e.duration_s, version: e.version ?? run.final.version, status: 'done', error: null });
-    if (isNew && isFresh(e)) toast(`Final cut v${run.final.version} ready · ${Number(e.duration_s || 0).toFixed(1)} s`, 'ok');
+    Object.assign(run.final, {
+      url: e.url,
+      duration_s: e.duration_s,
+      version: e.version ?? run.final.version,
+      captions_url: e.captions_url ?? null,
+      status: 'done',
+      error: null,
+    });
+    if (isNew && isFresh(e)) onFreshFinal(run);
   },
   direction(run, e) {
-    const key = `${e.instruction}|${e.summary}`;
-    const existing = run.directions.find((d) => `${d.instruction}|${d.summary}` === key);
+    // Dedupe on the bus `seq`; a snapshot entry (no seq) is adopted by the first matching replayed event.
+    const same = (d) => d.instruction === (e.instruction || '') && d.summary === (e.summary || '');
+    const existing = run.directions.find((d) => (e.seq != null && d._seq === e.seq) || (d._seq == null && same(d)));
     if (existing) {
       if (e.plan) existing.plan = e.plan;
+      if (e.seq != null) existing._seq = e.seq;
     } else {
-      run.directions.push({ instruction: e.instruction || '', summary: e.summary || '', plan: e.plan || null, ts: e.t });
+      run.directions.push({ instruction: e.instruction || '', summary: e.summary || '', plan: e.plan || null, ts: e.t, _seq: e.seq });
     }
     if (ui.pendingDirect && (!e.instruction || e.instruction === ui.pendingDirect)) ui.pendingDirect = null;
+    ui.directError = null;
   },
   localize_status(run, e) {
     const loc = ensureLoc(run, e.market);
     loc.status = e.status || loc.status;
     loc.error = e.status === 'error' ? e.error || 'localization failed' : null;
-    if (e.status === 'error' && isFresh(e)) toast(`Localize ${e.market}: ${loc.error}`, 'error');
+    if (e.status === 'rendering') Object.assign(loc, { scenes: [], voiceover: [], video_url: null, captions_url: null, music_url: null });
+    if (e.status === 'done' || e.status === 'error') ui.stages.localize?.active.delete(e.market);
+    // "No keyframes produced" is reported only here (not via an `error` event).
+    if (e.status === 'error' && isFresh(e)) notifyError('localize', `${e.market}: ${loc.error}`);
   },
   localize_plan(run, e) {
     ensureLoc(run, e.market).plan = e.plan || null;
   },
+  // Localized assets reuse file names across re-localizations; the event seq busts the media cache.
   localize_image(run, e) {
     const loc = ensureLoc(run, e.market);
-    const i = loc.scenes.findIndex((x) => x.scene_id === e.scene_id);
-    const item = { scene_id: e.scene_id, url: e.url, latency_ms: e.latency_ms };
-    if (i >= 0) loc.scenes[i] = item;
-    else loc.scenes.push(item);
+    upsertBy(loc.scenes, 'scene_id', { scene_id: e.scene_id, url: withBust(e.url, e.seq), latency_ms: e.latency_ms });
   },
   localize_music(run, e) {
     const loc = ensureLoc(run, e.market);
-    loc.music_url = e.url;
+    loc.music_url = withBust(e.url, e.seq);
     loc.music_latency_ms = e.latency_ms;
+  },
+  localize_voiceover(run, e) {
+    const loc = ensureLoc(run, e.market);
+    upsertBy(loc.voiceover, 'scene_id', { scene_id: e.scene_id, url: withBust(e.url, e.seq), text: e.text || '', latency_ms: e.latency_ms });
+  },
+  localize_video(run, e) {
+    const loc = ensureLoc(run, e.market);
+    Object.assign(loc, { video_url: withBust(e.url, e.seq), captions_url: withBust(e.captions_url, e.seq), video_duration_s: e.duration_s ?? null });
   },
   metrics(run, e) {
     if (e.metrics && typeof e.metrics === 'object') run.metrics = e.metrics;
   },
-  log(run, e) {
-    if (e.level === 'error' && isFresh(e)) toast(e.msg, 'error');
+  log() {
+    // Logged in the event log only: the matching `error` event carries the toast.
   },
   error(run, e) {
     if (e.stage === 'director' && !run.plan) run.status = 'error';
-    if (isFresh(e)) toast(`${e.stage || 'pipeline'}: ${e.msg || 'error'}`, 'error');
+    if (e.stage === 'direct') {
+      ui.pendingDirect = null;
+      ui.directError = e.msg || 'direction failed';
+    }
+    if (isFresh(e)) notifyError(e.stage, e.msg);
   },
   run_done(run, e) {
     if (run.status !== 'error') run.status = 'done';
@@ -909,6 +1089,7 @@ async function openRun(id, { replay = false, shell = null, speed = REPLAY_SPEED 
   }
   markDirty();
   connect(id, { replay, speed });
+  if (replay) window.AdLoopPosters?.attach?.(id, { replay: true, speed });
 }
 
 function initClock(run) {
@@ -969,14 +1150,41 @@ function renderAll() {
   }
   $('#run-view').classList.toggle('portrait', isPortrait(run));
   safely('rail', renderRail);
+  safely('gantt', renderGantt);
   safely('plan', renderPlan);
   safely('storyboard', renderStoryboard);
   safely('motion', renderMotion);
   safely('music', renderMusic);
   safely('final', renderFinal);
+  safely('banner', renderCutBanner);
   safely('localize', renderLocalize);
   safely('director', renderDirectorBar);
+  safely('present', refreshPresentation);
+  safely('flights', flyWinners);
   tick();
+}
+
+/** Timestamp of the user's last manual scroll; auto-scrolling backs off for a while after it. */
+let lastManualScroll = -Infinity;
+
+function initScrollTracking() {
+  const mark = () => (lastManualScroll = performance.now());
+  window.addEventListener('wheel', mark, { passive: true });
+  window.addEventListener('touchmove', mark, { passive: true });
+  window.addEventListener('keydown', (ev) => {
+    if (['PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown', ' '].includes(ev.key) && !ev.target.closest?.('input, textarea')) mark();
+  });
+}
+
+/**
+ * Scroll `el` into view once per run for `key` (e.g. the first frames, the first cut), but only
+ * when the user has not scrolled by hand recently: never fight someone who is reading.
+ */
+function autoScrollOnce(key, el) {
+  if (!el || ui.autoScrolled.has(key)) return;
+  ui.autoScrolled.add(key);
+  if (performance.now() - lastManualScroll < MANUAL_SCROLL_GRACE_MS || present.open) return;
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 /** A scene's winner is "decided" once the judge (or the user) has named it. */
@@ -1053,6 +1261,14 @@ function railNodeState(run, node) {
       derived = { rendering: 'active', done: 'done', error: 'error' }[run.music.status] || null;
       detail = run.music.versions.length ? `v${run.music.versions.length}` : '';
       break;
+    case 'voice': {
+      const vos = scenes.map((s) => s.voiceover);
+      const voiced = vos.filter((v) => v.url).length;
+      const busy = vos.some((v) => v.status === 'rendering' || v.status === 'queued');
+      derived = busy ? 'active' : n && voiced === n ? 'done' : vos.some((v) => v.status === 'error') ? 'error' : voiced ? 'active' : null;
+      detail = voiced || busy ? `${voiced}/${n} lines` : '';
+      break;
+    }
     case 'final':
       derived = { rendering: 'active', done: 'done', error: 'error' }[run.final.status] || null;
       detail = run.final.version ? `v${run.final.version}` : '';
@@ -1066,7 +1282,7 @@ function railNodeState(run, node) {
     default:
   }
   let status = eventActive ? 'active' : derived || (eventDone ? 'done' : eventErr ? 'error' : 'idle');
-  if (status === 'active' && !eventActive && run.status !== 'running' && derived === 'active' && !['motion', 'director'].includes(node.key)) status = 'done';
+  if (status === 'active' && !eventActive && run.status !== 'running' && derived === 'active' && !['motion', 'director', 'voice'].includes(node.key)) status = 'done';
   // Elapsed: current burst while active, else the last completed burst.
   let elapsed = null;
   const bursts = sts.filter((s) => s.burstStart != null);
@@ -1081,13 +1297,14 @@ function railNodeState(run, node) {
 /** Which modalities have in-flight work (backend metrics OR local derivation). */
 function inflight(run) {
   const m = run?.metrics?.inflight || {};
-  const out = { image: Number(m.image) || 0, video: Number(m.video) || 0, music: Number(m.music) || 0, text: Number(m.text) || 0 };
+  const out = Object.fromEntries(Object.keys(INFLIGHT_LABELS).map((k) => [k, Number(m[k]) || 0]));
   if (!run) return out;
   const active = (name) => (ui.stages[name]?.active.size || 0);
   out.image = Math.max(out.image, active('storyboard') + active('anchor') + active('localize'));
   out.video = Math.max(out.video, run.scenes.filter((s) => ['queued', 'rendering'].includes(s.clip.status)).length);
   out.music = Math.max(out.music, run.music.status === 'rendering' ? 1 : 0);
   out.text = Math.max(out.text, active('director') + active('judge') + active('direct') + (ui.pendingDirect ? 1 : 0));
+  out.tts = Math.max(out.tts, run.scenes.filter((s) => s.voiceover.status === 'rendering').length);
   return out;
 }
 
@@ -1095,14 +1312,20 @@ function inflight(run) {
 // 6. Top bar chips, pipeline rail, creative plan
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Model chips pulse while their modality has work in flight; the telemetry toggle mirrors any activity. */
 function renderModelChips() {
   const inf = inflight(store.run);
-  for (const mod of ['text', 'image', 'video', 'music']) {
+  let total = 0;
+  for (const mod of Object.keys(INFLIGHT_LABELS)) {
     const chip = $(`#chip-${mod}`);
     const n = inf[mod] || 0;
+    total += n;
     cls(chip, 'busy', n > 0);
     chip.dataset.count = n > 0 ? String(n) : '';
   }
+  const dot = $('#tele-activity');
+  dot.dataset.state = total > 0 ? 'busy' : store.run ? ui.sse : 'idle';
+  $('#telemetry-toggle').title = `Toggle telemetry (T) · ${total} request${total === 1 ? '' : 's'} in flight`;
 }
 
 function renderRail() {
@@ -1132,6 +1355,82 @@ function renderRail() {
   const label = ui.replay ? `REPLAY ${ui.replaySpeed}×` : run.status === 'running' ? 'LIVE' : run.status === 'error' ? 'ERROR' : 'DONE';
   setText(status, label);
   status.dataset.status = ui.replay ? 'replay' : run.status;
+}
+
+/** Timeline colour group per backend stage (see `.g-*` in styles.css). */
+const GANTT_GROUP = {
+  director: 'text', direct: 'text', anchor: 'image', storyboard: 'image', localize: 'image', judge: 'judge',
+  motion: 'video', music: 'music', final: 'final', voiceover: 'tts', voice: 'tts', tts: 'tts',
+};
+const GANTT_LEGEND = [['text', 'Flash'], ['image', 'NB2'], ['judge', 'Judge'], ['video', 'Omni'], ['music', 'Lyria'], ['tts', 'TTS'], ['final', 'Cut']];
+
+/**
+ * Live waterfall: one row per scene (+ plan, Lyria, localize lanes) with a coloured span per stage,
+ * scaled to the run clock. It is the visual proof that scene 1 renders video while scene 4 still judges.
+ */
+function renderGantt() {
+  const run = store.run;
+  const section = $('#gantt');
+  section.hidden = !ui.spans.length;
+  if (!ui.spans.length) return;
+  const legend = $('#gantt-legend');
+  if (!legend.childElementCount) legend.append(...GANTT_LEGEND.map(([g, label]) => h('span', { class: `g-key g-${g}` }, label)));
+  const now = nowT();
+  const running = run.status === 'running';
+  const last = Math.max(...ui.spans.map((sp) => sp.end ?? (running ? now : sp.start)));
+  const total = Math.max(1000, running ? Math.max(now, last) : last);
+  const used = new Set(ui.spans.map((sp) => sp.row));
+  const rows = [
+    { id: '_plan', label: 'Plan' },
+    ...run.scenes.map((sc, i) => ({ id: sc.id, label: `S${i + 1}` })),
+    { id: '_music', label: 'Lyria' },
+    { id: '_voice', label: 'Voice' },
+    { id: '_loc', label: 'Local' },
+  ].filter((r) => used.has(r.id) || /^s/.test(r.id));
+  reconcile(
+    $('#gantt-body'),
+    rows,
+    (r) => r.id,
+    (r) => h('div', { class: 'g-row' }, h('span', { class: 'g-label mono' }, r.label), h('div', { class: 'g-track' })),
+    (el, r) => {
+      const spans = ui.spans.map((sp, i) => ({ sp, i })).filter((x) => x.sp.row === r.id);
+      reconcile(
+        $('.g-track', el),
+        spans,
+        (x) => x.i,
+        (x) => h('i', { class: `g-span g-${GANTT_GROUP[x.sp.stage] || 'text'}${VOICE_STAGES.includes(x.sp.stage) && r.id.startsWith('s') ? ' g-sub' : ''}` }),
+        (bar, { sp }) => {
+          const end = sp.end ?? (running ? now : sp.start + 400);
+          bar.style.left = `${((sp.start / total) * 100).toFixed(2)}%`;
+          bar.style.width = `${Math.max(0.5, ((end - sp.start) / total) * 100).toFixed(2)}%`;
+          cls(bar, 'live', sp.end == null && running);
+          cls(bar, 'err', sp.status === 'error');
+          bar.title = `${sp.stage} · ${fmtMs(end - sp.start)}${sp.status === 'error' ? ' · failed' : ''}`;
+        },
+      );
+    },
+  );
+  // Unitless fraction: styles.css scales it across the track area (label column excluded).
+  section.style.setProperty('--now', running ? (now / total).toFixed(4) : '1');
+  cls(section, 'running', running);
+  setText($('.tl-label', section), `LIVE TIMELINE · 0 → ${fmtClock(total)} · every scene runs its own chain`);
+}
+
+/**
+ * Render big headline counters ({k, v, label}) into a section-meta element: speed must read
+ * from across the room, so frames / p50 / throughput get display-size numbers.
+ */
+function setCounters(el, items) {
+  reconcile(
+    el,
+    items.filter((x) => x.v != null && x.v !== ''),
+    (x) => x.k,
+    () => h('span', { class: 'counter' }, h('b', {}), h('small', {})),
+    (c, x) => {
+      setText($('b', c), x.v);
+      setText($('small', c), x.label);
+    },
+  );
 }
 
 /** Build the plan card; rebuilt only when the plan object changes. */
@@ -1214,11 +1513,14 @@ function renderStoryboard() {
   const firstRound = run.scenes.reduce((a, s) => a + s.variants.filter((v) => v.url && (v.round ?? 0) === 0).length, 0);
   const extra = run.scenes.reduce((a, s) => a + s.variants.filter((v) => v.url && (v.round ?? 0) > 0).length, 0);
   const expected = scenes.length * K;
-  setText(
-    $('#storyboard-meta'),
-    `${scenes.length} scenes × ${K} variants · ${firstRound}/${expected}${extra ? ` +${extra} repair/regen` : ''}${run.metrics.image_p50_ms ? ` · p50 ${fmtMs(run.metrics.image_p50_ms)}` : ''}`,
-  );
+  setCounters($('#storyboard-meta'), [
+    { k: 'frames', v: `${firstRound}/${expected}`, label: `${scenes.length}×${K} keyframes` },
+    { k: 'extra', v: extra ? `+${extra}` : null, label: 'repair / regen' },
+    { k: 'p50', v: run.metrics.image_p50_ms ? fmtMs(run.metrics.image_p50_ms) : null, label: 'NB2 p50' },
+    { k: 'ipm', v: run.metrics.images_per_min ? Number(run.metrics.images_per_min).toFixed(0) : null, label: 'images / min' },
+  ]);
   reconcile(root, scenes, (s) => s.id, createSceneRow, (el, s) => updateSceneRow(el, s, run, K));
+  if (firstRound > 0 && run.status === 'running' && !ui.replay) autoScrollOnce('storyboard', $('#storyboard-panel'));
 }
 
 function createSceneRow(s) {
@@ -1327,7 +1629,7 @@ function updateSceneRow(row, s, run, K) {
   const latestJudge = s.judge[s.judge.length - 1];
   const leader = !decided && latestJudge ? latestJudge.winner_index : null;
   const maxIdx = Math.max(K - 1, ...s.variants.map((v) => v.idx));
-  const expectedFor = (kind) => (kind === 'repair' ? REPAIR_VARIANTS : K);
+  const expectedFor = (kind) => (kind === 'repair' ? REPAIR_VARIANTS : kind === 'restyle' ? 1 : K);
 
   const lanes = rounds.map((r) => {
     const items = [];
@@ -1420,10 +1722,15 @@ function updateTile(tile, it, s, run, { decided, leader }) {
   }
   if (kind === 'anchor') {
     const has = !!run.anchor?.url;
+    // Anchor generation failed: the pipeline continues without one, so stop shimmering.
+    const failed = !has && (ui.stages.anchor?.errors || 0) > 0;
     cls(tile, 'ready', has);
+    cls(tile, 'failed', failed);
     const img = $('img', tile);
     setSrc(img, run.anchor?.url);
     img.hidden = !has;
+    setText($('.anchor-label', tile), failed ? 'no anchor' : 'continuity anchor');
+    tile.title = failed ? 'Continuity anchor failed; scenes render without it (see event log)' : '';
     setText($('.lat', tile), has && run.anchor.latency_ms ? fmtMs(run.anchor.latency_ms) : '');
   } else if (kind === 'marker') {
     setText($('.marker-label', tile), `${it.label} R${it.round}`);
@@ -1437,7 +1744,10 @@ function updateTile(tile, it, s, run, { decided, leader }) {
     setSrc($('img', tile), v.url);
     $('img', tile).alt = `${s.title || s.id} — variant ${v.idx + 1}`;
     setText($('.idx', tile), `#${v.idx + 1}${(v.round ?? 0) > 0 ? ` · ${v.kind === 'regenerate' ? 'regen' : v.kind || 'repair'}` : ''}`);
-    setText($('.lat', tile), fmtMs(v.latency_ms));
+    const lat = $('.lat', tile);
+    setText(lat, fmtMs(v.latency_ms));
+    const ms = Number(v.latency_ms) || 0;
+    lat.dataset.speed = ms < 1500 ? 'fast' : ms < 3000 ? 'mid' : 'slow';
     const scoreEl = $('.score', tile);
     setText(scoreEl, v.score != null ? fmtScore(v.score) : '');
     scoreEl.hidden = v.score == null;
@@ -1481,18 +1791,69 @@ function guardReplay() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 8. Motion lab (per-scene Omni clips + conversational editing)
+// 8. Motion lab (per-scene Omni clips + conversational editing + voiceover)
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * One shared preview player for every VO line in the studio, so two previews never overlap.
+ * `sceneKey` identifies what is playing (a scene id, or `market|scene` for localized lines).
+ */
+const voPreview = { audio: new Audio(), key: null };
+voPreview.audio.addEventListener('ended', () => {
+  voPreview.key = null;
+  markDirty();
+});
+voPreview.audio.addEventListener('pause', markDirty);
+
+/** Toggle playback of a narration take; returns nothing, re-renders the play buttons. */
+function toggleVoPreview(key, url) {
+  const a = voPreview.audio;
+  if (voPreview.key === key && !a.paused) {
+    a.pause();
+    voPreview.key = null;
+    return;
+  }
+  const u = safeUrl(url);
+  if (!u) return;
+  voPreview.key = key;
+  if (a.dataset.src !== u) {
+    a.dataset.src = u;
+    a.src = u;
+  }
+  a.currentTime = 0;
+  a.play?.().catch(() => toast('Could not play the narration preview.', 'warn'));
+  markDirty();
+}
+
+const voPlaying = (key) => voPreview.key === key && !voPreview.audio.paused;
+
+/** POST a re-voice request for one scene (text optional: omitted = same line, fresh take). */
+async function revoice(sceneId, text, button) {
+  if (guardReplay()) return;
+  const body = text ? { text } : {};
+  const ok = await act('Re-voice', () => api(`/api/runs/${store.runId}/scenes/${encodeURIComponent(sceneId)}/voiceover`, { method: 'POST', json: body }), { button });
+  if (ok) {
+    ui.pendingVoice[sceneId] = text || true;
+    toast(`Re-voicing ${sceneLabel(store.run, sceneId)} with Flash TTS…`, 'info');
+    markDirty();
+  }
+}
 
 function renderMotion() {
   const run = store.run;
   const grid = $('#motion-grid');
   const done = run.scenes.filter((s) => s.clip.versions.length).length;
   const edits = run.scenes.reduce((a, s) => a + Math.max(0, s.clip.versions.length - 1), 0);
-  setText($('#motion-meta'), run.scenes.length ? `${done}/${run.scenes.length} clips · ${edits} edits${run.metrics.video_p50_ms ? ` · p50 ${fmtMs(run.metrics.video_p50_ms)}` : ''}` : '');
+  setCounters($('#motion-meta'), [
+    { k: 'clips', v: `${done}/${run.scenes.length}`, label: 'Omni clips' },
+    { k: 'edits', v: edits ? String(edits) : null, label: 'edits' },
+    { k: 'p50', v: run.metrics.video_p50_ms ? fmtMs(run.metrics.video_p50_ms) : null, label: 'Omni p50' },
+  ]);
   $('#motion-panel').hidden = !run.scenes.length;
   reconcile(grid, run.scenes, (s) => s.id, createClipCard, (el, s) => updateClipCard(el, s, run));
 }
+
+let pendingEditSeq = 0;
 
 function createClipCard(s) {
   const input = h('input', { type: 'text', maxLength: 300, placeholder: 'Direct this shot…' });
@@ -1511,6 +1872,19 @@ function createClipCard(s) {
       h('span', { class: 'badge lat mono clip-lat' }),
     ),
     h('div', { class: 'clip-bar' }, h('span', { class: 'status-chip' }), h('div', { class: 'pills' })),
+    h(
+      'div',
+      { class: 'vo' },
+      h(
+        'div',
+        { class: 'vo-head' },
+        h('span', { class: 'vo-tag mono' }, 'VO'),
+        h('span', { class: 'vo-status mono' }),
+        h('button', { class: 'vo-play', type: 'button', title: 'Preview this narration take', 'aria-label': 'Preview narration' }, '▶'),
+        h('button', { class: 'btn ghost xs vo-send', type: 'button', title: 'Re-voice this line with Flash TTS (Enter)' }, '↻ re-voice'),
+      ),
+      h('textarea', { class: 'vo-text', rows: 2, maxLength: 300, placeholder: 'Narration for this scene…', 'aria-label': 'Voiceover line' }),
+    ),
     h('ol', { class: 'clip-chat' }),
     form,
     h(
@@ -1533,7 +1907,7 @@ function createClipCard(s) {
       { button: $('button[type=submit]', form) },
     );
     if (ok) {
-      (ui.pendingEdits[sid] ||= []).push({ instruction, baseV });
+      (ui.pendingEdits[sid] ||= []).push({ id: ++pendingEditSeq, instruction, baseV });
       input.value = '';
       markDirty();
     }
@@ -1552,7 +1926,60 @@ function createClipCard(s) {
     ui.clipView[card.dataset.key] = Number(b.dataset.v);
     markDirty();
   });
+  // Voiceover: the textarea is user-owned while dirty; state updates only overwrite a clean one.
+  const voText = $('.vo-text', card);
+  const voSend = () => revoice(card.dataset.key, voText.value.trim(), $('.vo-send', card));
+  voText.addEventListener('input', () => {
+    voText._dirty = voText.value !== voText._synced;
+    cls(card, 'vo-dirty', voText._dirty);
+  });
+  voText.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && !ev.shiftKey) {
+      ev.preventDefault();
+      voSend();
+    }
+  });
+  $('.vo-send', card).addEventListener('click', voSend);
+  $('.vo-play', card).addEventListener('click', () => {
+    const s = store.run?.scenes.find((x) => x.id === card.dataset.key);
+    if (s?.voiceover.url) toggleVoPreview(s.id, withBust(s.voiceover.url, s.voiceover.v));
+  });
   return card;
+}
+
+/** Patch a clip card's voiceover block from `scene.voiceover` (CONTRACT §9c). */
+function updateVoiceBlock(card, s) {
+  const vo = s.voiceover;
+  const ta = $('.vo-text', card);
+  if (ta._synced !== vo.text) {
+    if (!ta._dirty || ta.value === vo.text) {
+      ta.value = vo.text || '';
+      ta._dirty = false;
+    }
+    ta._synced = vo.text;
+  }
+  cls(card, 'vo-dirty', !!ta._dirty);
+  const pending = ui.pendingVoice[s.id];
+  const busy = vo.status === 'rendering' || vo.status === 'queued' || !!pending;
+  const status = $('.vo-status', card);
+  status.dataset.status = vo.status === 'error' ? 'error' : busy ? 'busy' : vo.url ? 'done' : 'idle';
+  setText(
+    status,
+    vo.status === 'error'
+      ? `failed: ${truncate(vo.error, 40)}`
+      : busy
+        ? pending ? 're-voicing…' : 'voicing…'
+        : vo.url
+          ? `take ${vo.v || 1} · ${vo.duration_s ? `${Number(vo.duration_s).toFixed(1)} s · ` : ''}${fmtMs(vo.latency_ms)}`
+          : vo.text ? 'waiting for Flash TTS' : 'narration arrives with the plan',
+  );
+  status.title = vo.error || '';
+  const play = $('.vo-play', card);
+  play.disabled = !vo.url;
+  const playing = voPlaying(s.id);
+  setText(play, playing ? '❚❚' : '▶');
+  cls(play, 'on', playing);
+  $('.vo-send', card).disabled = busy || ui.replay || !(ta.value.trim() || vo.text);
 }
 
 function updateClipCard(card, s, run) {
@@ -1561,7 +1988,12 @@ function updateClipCard(card, s, run) {
   const win = winnerDecided(s) ? winnerVariant(s) : null;
   const ver = clipVersion(s);
   const active = c.status === 'queued' || c.status === 'rendering';
+  const maxV = Math.max(0, ...c.versions.map((v) => v.v));
   card.dataset.status = c.status;
+  // Glow while the latest one-sentence direction is re-rendering this shot.
+  const lastDir = run.directions[run.directions.length - 1];
+  const directed = (lastDir?.plan?.scene_edits || []).some((se) => se.scene_id === s.id);
+  cls(card, 'directing', directed && active);
   setText($('.clip-label', card), `S${i + 1} · ${s.title || s.id}`);
 
   const poster = $('.clip-poster', card);
@@ -1582,22 +2014,23 @@ function updateClipCard(card, s, run) {
   // Status chip.
   const chip = $('.status-chip', card);
   chip.dataset.status = c.status;
+  const editing = (ui.pendingEdits[s.id] || []).some((p) => !p.failed);
   const label =
     c.status === 'queued'
       ? 'queued'
       : c.status === 'rendering'
         ? ver
-          ? `editing → v${(ver?.v || 0) + 1}`
+          ? `${editing ? 'editing' : 're-rendering'} → v${maxV + 1}`
           : 'rendering'
         : c.status === 'error'
           ? `error: ${truncate(c.error, 60)}`
           : c.status === 'done' || ver
-            ? `v${ver?.v ?? '?'} ready`
+            ? `v${ver?.v ?? '?'} ready${c.lastError ? ' · last edit failed' : ''}`
             : win
               ? 'waiting for Omni'
               : 'waiting for winner';
   setText(chip, label);
-  chip.title = c.error || '';
+  chip.title = c.error || c.lastError || '';
 
   // Version pills.
   reconcile(
@@ -1613,15 +2046,25 @@ function updateClipCard(card, s, run) {
     },
   );
 
-  // Chat history: instruction → version, plus local pending edits.
-  const maxV = Math.max(0, ...c.versions.map((v) => v.v));
-  const pend = (ui.pendingEdits[s.id] || []).filter((p) => !c.versions.some((v) => v.v > p.baseV && v.instruction === p.instruction) && maxV <= p.baseV + (ui.pendingEdits[s.id] || []).indexOf(p));
+  // Chat history: instruction → version, plus local pending edits. A pending edit leaves only when
+  // a newer version with its instruction lands, or ~8 s after it failed (shown in red meanwhile).
+  const now = performance.now();
+  const pend = (ui.pendingEdits[s.id] || []).filter(
+    (p) => !c.versions.some((v) => v.v > p.baseV && v.instruction === p.instruction) && !(p.failedAt && now - p.failedAt > 8000),
+  );
   ui.pendingEdits[s.id] = pend;
   const chat = [
     ...c.versions
       .filter((v) => v.instruction)
       .map((v) => ({ key: `v${v.v}`, text: v.instruction, out: `v${v.v}`, meta: [v.kind === 'direct' ? 'direct' : '', fmtMs(v.latency_ms), v.fallback || ''].filter(Boolean).join(' · ') })),
-    ...pend.map((p, k) => ({ key: `p${k}:${p.instruction}`, text: p.instruction, out: '…', meta: 'Omni editing', pending: true })),
+    ...pend.map((p) => ({
+      key: `p${p.id}`,
+      text: p.instruction,
+      out: p.failed ? '✕' : '…',
+      meta: p.failed ? `failed · ${truncate(p.error, 60)}` : 'Omni editing',
+      pending: !p.failed,
+      failed: p.failed,
+    })),
   ];
   const chatEl = $('.clip-chat', card);
   chatEl.hidden = !chat.length;
@@ -1632,6 +2075,7 @@ function updateClipCard(card, s, run) {
     (m) => h('li', { class: 'msg' }, h('span', { class: 'msg-text' }), h('span', { class: 'msg-out mono' }), h('span', { class: 'msg-meta mono' })),
     (el, m) => {
       cls(el, 'pending', m.pending);
+      cls(el, 'failed', m.failed);
       setText($('.msg-text', el), `“${m.text}”`);
       setText($('.msg-out', el), `→ ${m.out}`);
       setText($('.msg-meta', el), m.meta);
@@ -1639,6 +2083,7 @@ function updateClipCard(card, s, run) {
   );
   const canEdit = !!win || c.versions.length > 0;
   for (const el of $$('input, button', $('.clip-form', card)).concat($$('.qchip', card))) el.disabled = !canEdit;
+  updateVoiceBlock(card, s);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1656,8 +2101,14 @@ function renderMusic() {
   chip.dataset.status = m.status;
   setText(chip, m.status === 'rendering' ? `scoring${m._reason ? ` · ${m._reason}` : ''}` : m.status === 'error' ? `error: ${truncate(m.error, 50)}` : cur ? `v${cur.v} ready` : 'waiting for plan');
   const audio = $('audio', panel);
-  setSrc(audio, cur?.url);
+  // A new score version replaces the old one mid-listen: keep playing on the new take.
+  const wasPlaying = !audio.paused && !audio.ended;
+  if (setSrc(audio, cur?.url) && wasPlaying) audio.play?.().catch(() => {});
   $('.audio-wrap', panel).hidden = !cur;
+  const why = $('.rescore-why', panel);
+  const reason = cur && cur.v > 1 ? cur.reason : null;
+  setText(why, reason ? `re-scored because: ${reason}` : '');
+  why.hidden = !reason;
   $('.music-skel', panel).hidden = !!cur;
   cls($('.music-skel', panel), 'busy', m.status === 'rendering' || ui.pendingMusic);
 
@@ -1674,6 +2125,12 @@ function renderMusic() {
       setText($('.seg-t', el), sceneLabel(run, s.id));
       setText($('.seg-m', el), s.mood || s.beat || '');
       el.title = `${s.title || s.id} — ${s.mood || ''} · energy ${Number(s.energy ?? 0).toFixed(2)}`;
+      if (s._pulseAt != null && el._pulseAt !== s._pulseAt) {
+        el._pulseAt = s._pulseAt;
+        el.classList.remove('pulse');
+        void el.offsetWidth; // restart the animation
+        el.classList.add('pulse');
+      }
     },
   );
   $('.timeline-wrap', panel).hidden = !run.scenes.length;
@@ -1705,6 +2162,7 @@ function buildMusicPanel(panel) {
     h('div', { class: 'section-head' }, h('h2', {}, h('span', { class: 'step-no' }, '05'), 'Soundtrack ', h('span', { class: 'muted small' }, 'Lyria 3.5 · adaptive')), h('span', { class: 'status-chip' })),
     h('div', { class: 'music-skel' }, h('div', { class: 'eq' }, Array.from({ length: 24 }, () => h('i'))), h('span', { class: 'muted small' }, 'Lyria starts scoring the moment the plan lands…')),
     h('div', { class: 'audio-wrap' }, audio),
+    h('p', { class: 'rescore-why mono', hidden: true }),
     h('div', { class: 'timeline-wrap' }, h('div', { class: 'tl-label mono muted' }, 'MOOD TIMELINE'), h('div', { class: 'tl-track' }, h('div', { class: 'mood-timeline' }), playhead)),
     h('ol', { class: 'music-versions' }),
     h('details', { class: 'prompt-details' }, h('summary', {}, 'Lyria prompt'), h('pre', { class: 'music-prompt mono' })),
@@ -1744,7 +2202,18 @@ function renderFinal() {
   const url = f.url ? `${f.url}${f.url.includes('?') ? '&' : '?'}v=${f.version || 0}` : null;
   const video = $('video', panel);
   setSrc(video, url);
+  setCaptions(video, f.captions_url ? withBust(f.captions_url, f.version) : null);
   const has = !!url;
+  if (has && ui.celebratePending) {
+    ui.celebratePending = false;
+    const player = $('.final-player', panel);
+    player.classList.remove('celebrate');
+    void player.offsetWidth;
+    player.classList.add('celebrate');
+    video.muted = true; // autoplay policies allow muted playback without a gesture
+    video.play?.().catch(() => {});
+    autoScrollOnce('final', panel);
+  }
   $('.final-player', panel).hidden = !has;
   const waiting = $('.final-wait', panel);
   waiting.hidden = has;
@@ -1753,7 +2222,13 @@ function renderFinal() {
   setText(chip, f.status === 'rendering' ? 'stitching…' : f.status === 'error' ? `error: ${truncate(f.error, 50)}` : has ? `v${f.version} · ${Number(f.duration_s || 0).toFixed(1)} s` : 'waiting');
   if (!has) {
     const clips = run.scenes.filter((s) => s.clip.versions.length).length;
-    setText($('.wait-text', panel), f.status === 'rendering' ? 'ffmpeg is cutting clips + score together…' : `Auto-stitches when every clip and the score are ready · clips ${clips}/${run.scenes.length || '—'} · score ${run.music.versions.length ? '✓' : '…'}`);
+    const voiced = run.scenes.filter((s) => s.voiceover.url || s.voiceover.status === 'error').length;
+    setText(
+      $('.wait-text', panel),
+      f.status === 'rendering'
+        ? 'ffmpeg is cutting clips, score and narration together…'
+        : `Auto-stitches when every clip, the score and the narration are ready · clips ${clips}/${run.scenes.length || '—'} · score ${run.music.versions.length ? '✓' : '…'} · voice ${voiced}/${run.scenes.length || '—'}`,
+    );
   }
   const dl = $('.dl-btn', panel);
   dl.hidden = !has;
@@ -1763,6 +2238,91 @@ function renderFinal() {
   }
   $('.present-btn', panel).disabled = !run.plan;
   $('.restitch-btn', panel).disabled = !run.scenes.some((s) => s.clip.versions.length);
+}
+
+/**
+ * Point a <video>'s single captions <track> at `url` (WebVTT from the stitcher). The track is
+ * replaced (not mutated) whenever the URL changes, so a new final version gets its new cues.
+ */
+function setCaptions(video, url) {
+  const u = safeUrl(url || '');
+  if ((video.dataset.captions || '') === u) return;
+  video.dataset.captions = u;
+  for (const t of $$('track', video)) t.remove();
+  if (!u) return;
+  const track = h('track', { kind: 'captions', srclang: 'en', label: 'Narration', src: u, default: true });
+  video.appendChild(track);
+  track.addEventListener('load', () => {
+    if (track.track) track.track.mode = 'showing';
+  });
+  if (track.track) track.track.mode = 'showing';
+}
+
+/** The first fresh final cut of a run: celebrate it (banner + autoplay + scroll), once. */
+function onFreshFinal() {
+  if (ui.celebrated) return;
+  ui.celebrated = true;
+  ui.celebratePending = true;
+}
+
+/** One-shot "brief → finished ad" banner with the headline numbers and a Present CTA. */
+function renderCutBanner() {
+  const run = store.run;
+  const banner = $('#cut-banner');
+  if (!ui.celebrated || banner.dataset.dismissed === run.id) {
+    banner.hidden = true;
+    return;
+  }
+  const m = metricsView(run);
+  const ttf = m.time_to_final_ms ?? run._wall_ms;
+  const lines = run.scenes.filter((s) => s.voiceover.url).length;
+  const facts = [
+    `${fmtMetric(m.images_generated, 'n')} keyframes`,
+    `${run.scenes.filter((s) => s.clip.versions.length).length} Omni clips`,
+    run.music.versions.length ? 'Lyria score' : null,
+    lines ? `${lines} narrated lines` : null,
+  ].filter(Boolean);
+  const sig = `${ttf}|${facts.join('|')}`;
+  banner.hidden = false;
+  if (banner.dataset.sig === sig) return;
+  banner.dataset.sig = sig;
+  const close = h('button', { class: 'cut-banner-close', type: 'button', 'aria-label': 'Dismiss' }, '×');
+  close.addEventListener('click', () => {
+    banner.dataset.dismissed = run.id;
+    markDirty();
+  });
+  const go = h('button', { class: 'btn grad', type: 'button' }, '▶ Present');
+  go.addEventListener('click', () => openPresentation());
+  banner.replaceChildren(
+    h('div', { class: 'cut-banner-text' }, h('b', {}, ttf ? `Brief → finished ad in ${fmtMs(ttf)}` : 'Your ad is cut'), h('span', { class: 'mono' }, facts.join(' · '))),
+    go,
+    close,
+  );
+}
+
+/**
+ * Winner → Omni hand-off made visible: a clone of the freshly crowned keyframe flies from its
+ * storyboard tile to the scene's clip card (FLIP-style transform). Skipped when either end is off-screen.
+ */
+function flyWinners() {
+  const queue = ui.flights.splice(0);
+  for (const sid of queue) {
+    const img = $(`#storyboard .tile.winner[data-scene="${CSS.escape(sid)}"] img`);
+    const card = $(`#motion-grid .clip-card[data-key="${CSS.escape(sid)}"] .clip-media`);
+    if (!img?.src || !card) continue;
+    const a = img.getBoundingClientRect();
+    const b = card.getBoundingClientRect();
+    const visible = (r) => r.width > 0 && r.bottom > 0 && r.top < window.innerHeight;
+    if (!visible(a) || !visible(b)) continue;
+    const flyer = h('img', { class: 'flyer', src: img.src, alt: '' });
+    Object.assign(flyer.style, { left: `${a.left}px`, top: `${a.top}px`, width: `${a.width}px`, height: `${a.height}px` });
+    document.body.appendChild(flyer);
+    requestAnimationFrame(() => {
+      flyer.style.transform = `translate(${b.left - a.left}px, ${b.top - a.top}px) scale(${b.width / a.width}, ${b.height / a.height})`;
+      flyer.style.opacity = '0.25';
+    });
+    setTimeout(() => flyer.remove(), 700);
+  }
 }
 
 function buildFinalPanel(panel) {
@@ -1804,53 +2364,111 @@ function renderLocalize() {
 
   const markets = Object.keys(run.localizations);
   $('.loc-empty', panel).hidden = markets.length > 0;
+  reconcile($('.loc-grid', panel), markets, (m) => m, createLocRow, (el, m) => updateLocRow(el, m, run));
+}
+
+function createLocRow(m) {
+  const video = h('video', { class: 'loc-video', controls: true, playsInline: true, preload: 'metadata' });
+  const row = h(
+    'div',
+    { class: 'loc-row' },
+    h(
+      'div',
+      { class: 'loc-head' },
+      h('div', { class: 'loc-market' }, h('b', {}, m), h('span', { class: 'loc-lang muted small' })),
+      h('div', { class: 'loc-copy' }, h('span', { class: 'loc-tag' }), h('span', { class: 'loc-cta' })),
+      h('span', { class: 'status-chip' }),
+      h('audio', { controls: true, preload: 'none', class: 'loc-audio', title: 'Regional Lyria score' }),
+    ),
+    h(
+      'div',
+      { class: 'loc-body' },
+      h('div', { class: 'loc-video-wrap' }, video, h('span', { class: 'loc-video-cap mono muted' })),
+      h('div', { class: 'loc-side' }, h('div', { class: 'loc-tiles' }), h('ol', { class: 'loc-vo' })),
+    ),
+  );
+  $('.loc-vo', row).addEventListener('click', (ev) => {
+    const b = ev.target.closest('.vo-play');
+    if (b?.dataset.url) toggleVoPreview(`${m}|${b.dataset.scene}`, b.dataset.url);
+  });
+  return row;
+}
+
+/** Patch one market row: copy, status, regional score, animatic (with captions), keyframes, VO lines. */
+function updateLocRow(el, m, run) {
+  const loc = run.localizations[m];
+  const p = loc.plan || {};
+  setText($('.loc-lang', el), [p.language, p.voice].filter(Boolean).join(' · '));
+  setText($('.loc-tag', el), p.tagline ? `“${p.tagline}”` : '');
+  setText($('.loc-cta', el), p.cta || '');
+  const chip = $('.status-chip', el);
+  const done = loc.scenes.length;
+  const settled = loc.status === 'done' || loc.status === 'error';
+  chip.dataset.status = loc.status === 'error' ? 'error' : loc.status === 'done' ? 'done' : 'rendering';
+  setText(
+    chip,
+    loc.status === 'error'
+      ? `error: ${truncate(loc.error, 40)}`
+      : loc.status === 'done'
+        ? `${done} frames${loc.voiceover.length ? ` · ${loc.voiceover.length} lines` : ''}${loc.video_url ? ' · animatic' : ''}`
+        : `${loc.status || 'working'} · ${done}/${run.scenes.length}`,
+  );
+  const audio = $('.loc-audio', el);
+  setSrc(audio, loc.music_url);
+  audio.hidden = !loc.music_url;
+
+  // Animatic: Ken Burns of the localized keyframes + regional score + localized narration.
+  const video = $('.loc-video', el);
+  setSrc(video, loc.video_url);
+  setCaptions(video, loc.captions_url);
+  const hasVideo = !!loc.video_url;
+  $('.loc-video-wrap', el).hidden = !hasVideo;
+  cls($('.loc-body', el), 'no-video', !hasVideo);
+  setText($('.loc-video-cap', el), hasVideo ? `animatic${loc.video_duration_s ? ` · ${Number(loc.video_duration_s).toFixed(1)} s` : ''} · NB2 + Lyria + Flash TTS` : '');
+
+  const tiles = run.scenes.map((s) => ({ s, img: loc.scenes.find((x) => x.scene_id === s.id) }));
   reconcile(
-    $('.loc-grid', panel),
-    markets,
-    (m) => m,
-    (m) =>
-      h(
-        'div',
-        { class: 'loc-row' },
-        h(
-          'div',
-          { class: 'loc-head' },
-          h('div', { class: 'loc-market' }, h('b', {}, m), h('span', { class: 'loc-lang muted small' })),
-          h('div', { class: 'loc-copy' }, h('span', { class: 'loc-tag' }), h('span', { class: 'loc-cta' })),
-          h('span', { class: 'status-chip' }),
-          h('audio', { controls: true, preload: 'none', class: 'loc-audio' }),
-        ),
-        h('div', { class: 'loc-tiles' }),
-      ),
-    (el, m) => {
-      const loc = run.localizations[m];
-      const p = loc.plan || {};
-      setText($('.loc-lang', el), p.language || '');
-      setText($('.loc-tag', el), p.tagline ? `“${p.tagline}”` : '');
-      setText($('.loc-cta', el), p.cta || '');
-      const chip = $('.status-chip', el);
-      const done = loc.scenes.length;
-      chip.dataset.status = loc.status === 'error' ? 'error' : loc.status === 'done' ? 'done' : 'rendering';
-      setText(chip, loc.status === 'error' ? `error: ${truncate(loc.error, 40)}` : loc.status === 'done' ? `${done} frames` : `${loc.status || 'working'} · ${done}/${run.scenes.length}`);
-      const audio = $('.loc-audio', el);
-      setSrc(audio, loc.music_url);
-      audio.hidden = !loc.music_url;
-      const tiles = run.scenes.map((s) => ({ s, img: loc.scenes.find((x) => x.scene_id === s.id) }));
-      reconcile(
-        $('.loc-tiles', el),
-        tiles,
-        (t) => t.s.id,
-        () => h('div', { class: 'tile loc-tile' }, h('div', { class: 'shimmer' }), h('img', { alt: '' }), h('span', { class: 'badge idx mono' }), h('span', { class: 'badge lat mono' })),
-        (tile, t) => {
-          const has = !!t.img?.url;
-          const img = $('img', tile);
-          if (setSrc(img, t.img?.url) && has) tile.classList.add('pop');
-          img.hidden = !has;
-          $('.shimmer', tile).hidden = has || loc.status === 'done' || loc.status === 'error';
-          setText($('.idx', tile), sceneLabel(run, t.s.id));
-          setText($('.lat', tile), has ? fmtMs(t.img.latency_ms) : '');
-        },
-      );
+    $('.loc-tiles', el),
+    tiles,
+    (t) => t.s.id,
+    () => h('div', { class: 'tile loc-tile' }, h('div', { class: 'shimmer' }), h('img', { alt: '' }), h('span', { class: 'badge idx mono' }), h('span', { class: 'badge lat mono' })),
+    (tile, t) => {
+      const has = !!t.img?.url;
+      const img = $('img', tile);
+      if (setSrc(img, t.img?.url) && has) tile.classList.add('pop');
+      img.hidden = !has;
+      $('.shimmer', tile).hidden = has || settled;
+      setText($('.idx', tile), sceneLabel(run, t.s.id));
+      setText($('.lat', tile), has ? fmtMs(t.img.latency_ms) : '');
+    },
+  );
+
+  // Localized narration lines: the TTS takes when they land, else the plan's translated text.
+  const planned = Array.isArray(p.voiceover) ? p.voiceover : [];
+  const lines = run.scenes
+    .map((s) => {
+      const take = loc.voiceover.find((x) => x.scene_id === s.id);
+      const text = take?.text || planned.find((x) => x.scene_id === s.id)?.text || '';
+      return text ? { s, text, url: take?.url || null } : null;
+    })
+    .filter(Boolean);
+  const voList = $('.loc-vo', el);
+  voList.hidden = !lines.length;
+  reconcile(
+    voList,
+    lines,
+    (x) => x.s.id,
+    () => h('li', {}, h('span', { class: 'scene-tag' }), h('span', { class: 'vo-line' }), h('button', { class: 'vo-play', type: 'button', 'aria-label': 'Play localized line' }, '▶')),
+    (li, x) => {
+      setText($('.scene-tag', li), sceneLabel(run, x.s.id));
+      setText($('.vo-line', li), x.text);
+      const b = $('.vo-play', li);
+      b.dataset.scene = x.s.id;
+      b.dataset.url = x.url || '';
+      b.disabled = !x.url;
+      const on = voPlaying(`${m}|${x.s.id}`);
+      setText(b, on ? '❚❚' : '▶');
+      cls(b, 'on', on);
     },
   );
 }
@@ -1864,7 +2482,7 @@ function buildLocalizePanel(panel) {
   );
   const go = h('button', { class: 'btn grad sm loc-go', type: 'button' }, 'Localize');
   panel.replaceChildren(
-    h('div', { class: 'section-head' }, h('h2', {}, h('span', { class: 'step-no' }, '07'), 'Localize ', h('span', { class: 'muted small' }, 'NB2 edits of every winning keyframe · Lyria regional score')), go),
+    h('div', { class: 'section-head' }, h('h2', {}, h('span', { class: 'step-no' }, '07'), 'Localize ', h('span', { class: 'muted small' }, 'NB2 keyframes · Lyria regional score · Flash TTS narration · animatic')), go),
     chips,
     h('p', { class: 'loc-empty muted small' }, 'Pick markets — each one fans out in parallel: translated on-image text, culturally adapted cast & setting, same composition and product.'),
     h('div', { class: 'loc-grid' }),
@@ -1899,7 +2517,9 @@ function renderDirectorBar() {
   const fan = $('#dir-fanout');
   const last = run.directions[run.directions.length - 1];
   const items = [];
-  if (ui.pendingDirect) {
+  if (ui.voiceSend) {
+    items.push({ key: 'voice-send', kind: 'pending', text: `Sending “${truncate(ui.voiceSend.text, 60)}” in a moment · type or Esc to edit` });
+  } else if (ui.pendingDirect) {
     items.push({ key: `pending:${ui.pendingDirect}`, kind: 'pending', text: `Gemini is breaking “${truncate(ui.pendingDirect, 70)}” into shot edits…` });
   } else if (last) {
     items.push({ key: `sum:${last.instruction}`, kind: 'summary', text: last.summary || last.instruction });
@@ -1907,12 +2527,18 @@ function renderDirectorBar() {
     for (const se of Array.isArray(p.scene_edits) ? p.scene_edits : []) {
       const s = run.scenes.find((x) => x.id === se.scene_id);
       const st = s?.clip.status;
-      items.push({ key: `se:${se.scene_id}`, kind: 'edit', text: `${sceneLabel(run, se.scene_id)} · ${truncate(se.omni_instruction, 48)}`, busy: st === 'queued' || st === 'rendering', err: st === 'error' });
+      items.push({ key: `se:${se.scene_id}`, kind: 'edit', scene: se.scene_id, text: `${sceneLabel(run, se.scene_id)} · ${truncate(se.omni_instruction, 48)}`, busy: st === 'queued' || st === 'rendering', err: st === 'error' });
     }
     if (p.music?.rescore) items.push({ key: 'music', kind: 'edit', text: `♫ re-score · ${truncate(p.music.instruction, 40)}`, busy: run.music.status === 'rendering' });
     if (p.restyle_keyframes) items.push({ key: 'restyle', kind: 'edit', text: 'NB2 restyle keyframes', busy: (ui.stages.storyboard?.active.size || 0) > 0 });
+    for (const vu of Array.isArray(p.voiceover_updates) ? p.voiceover_updates : []) {
+      const vo = run.scenes.find((x) => x.id === vu.scene_id)?.voiceover;
+      items.push({ key: `vo:${vu.scene_id}`, kind: 'edit', scene: vu.scene_id, text: `🎙 ${sceneLabel(run, vu.scene_id)} re-voice · ${truncate(vu.text, 36)}`, busy: vo?.status === 'rendering', err: vo?.status === 'error' });
+    }
+    if (p.voice_style) items.push({ key: 'vo-style', kind: 'edit', text: `🎙 tone · ${truncate(p.voice_style, 40)}`, busy: run.scenes.some((x) => x.voiceover.status === 'rendering') });
     if (run.final.status === 'rendering') items.push({ key: 'final', kind: 'edit', text: '✂ re-stitching', busy: true });
   }
+  if (ui.directError && !ui.pendingDirect && !ui.voiceSend) items.push({ key: 'dir-err', kind: 'edit', text: `Direction failed: ${truncate(ui.directError, 90)}`, err: true });
   fan.hidden = !items.length;
   reconcile(
     fan,
@@ -1921,7 +2547,9 @@ function renderDirectorBar() {
     (x) => h('span', { class: `fan-item fan-${x.kind}` }),
     (el, x) => {
       setText(el, x.text);
-      el.title = x.text;
+      el.title = x.scene ? `${x.text} · click to jump to the shot` : x.text;
+      if (x.scene) el.dataset.scene = x.scene;
+      cls(el, 'jump', !!x.scene);
       cls(el, 'busy', x.busy || x.kind === 'pending');
       cls(el, 'err', x.err);
       cls(el, 'done', x.kind === 'edit' && !x.busy && !x.err);
@@ -1930,8 +2558,42 @@ function renderDirectorBar() {
   $('#dir-send').disabled = !!ui.pendingDirect;
 }
 
+/** Clicking a fan-out chip scrolls to the clip card it is re-rendering. */
+function onFanoutClick(ev) {
+  const sid = ev.target.closest('.fan-item[data-scene]')?.dataset.scene;
+  const card = sid && $(`#motion-grid .clip-card[data-key="${CSS.escape(sid)}"]`);
+  if (!card) return;
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.classList.remove('flash-card');
+  void card.offsetWidth;
+  card.classList.add('flash-card');
+}
+
+/**
+ * A spoken direction is sent automatically after a short, cancellable countdown: voice →
+ * whole-ad re-render with no extra click. Typing in the field (or Esc) cancels it.
+ */
+function queueSpokenDirection(text) {
+  cancelSpokenDirection();
+  $('#dir-input').value = text;
+  ui.voiceSend = { text, timer: setTimeout(() => {
+    ui.voiceSend = null;
+    submitDirection(text);
+  }, 1400) };
+  markDirty();
+}
+
+function cancelSpokenDirection() {
+  if (!ui.voiceSend) return false;
+  clearTimeout(ui.voiceSend.timer);
+  ui.voiceSend = null;
+  markDirty();
+  return true;
+}
+
 async function submitDirection(instruction) {
   if (!instruction || guardReplay()) return;
+  ui.directError = null;
   const ok = await act('Direct', () => api(`/api/runs/${store.runId}/direct`, { method: 'POST', json: { instruction } }), { button: $('#dir-send') });
   if (ok) {
     ui.pendingDirect = instruction;
@@ -1960,7 +2622,10 @@ function metricsView(run) {
   m.judge_calls ??= run.scenes.reduce((a, s) => a + s.judge.length, 0) || null;
   m.videos_generated ??= run.scenes.reduce((a, s) => a + s.clip.versions.length, 0) || null;
   m.music_versions ??= run.music.versions.length || null;
+  m.voiceovers_generated ??= run.scenes.filter((s) => s.voiceover.url).length || null;
   m.wall_ms ??= run._wall_ms ?? null;
+  // Wall time keeps counting between (throttled) metrics events while the run is live.
+  if (run.status === 'running' && !ui.replay) m.wall_ms = Math.max(Number(m.wall_ms) || 0, nowT());
   return m;
 }
 
@@ -1978,6 +2643,7 @@ function renderTelemetry() {
       const vEl = $('.tval', el);
       if (vEl.textContent !== val) {
         vEl.textContent = val;
+        if (key === 'wall_ms') return; // a live clock, not a new measurement: no bump
         el.classList.remove('bump');
         void el.offsetWidth; // restart the bump animation
         el.classList.add('bump');
@@ -1987,9 +2653,9 @@ function renderTelemetry() {
   const inf = inflight(run);
   reconcile(
     $('#inflight'),
-    ['image', 'video', 'music', 'text'],
+    Object.keys(INFLIGHT_LABELS),
     (k) => k,
-    (k) => h('div', { class: 'ibar', dataset: { mod: k } }, h('span', { class: 'ilabel mono' }, { image: 'NB2', video: 'Omni', music: 'Lyria', text: 'Flash' }[k]), h('span', { class: 'itrack' }, h('i')), h('span', { class: 'icount mono' })),
+    (k) => h('div', { class: 'ibar', dataset: { mod: k } }, h('span', { class: 'ilabel mono' }, INFLIGHT_LABELS[k]), h('span', { class: 'itrack' }, h('i')), h('span', { class: 'icount mono' })),
     (el, k) => {
       const n = inf[k] || 0;
       $('i', el).style.width = `${Math.min(100, (n / INFLIGHT_CAPS[k]) * 100)}%`;
@@ -2059,6 +2725,14 @@ function summarize(e) {
       return `${e.market} ${e.scene_id} ${f(e.latency_ms)}`;
     case 'localize_music':
       return `${e.market} ${f(e.latency_ms)}`;
+    case 'localize_voiceover':
+      return `${e.market} ${e.scene_id} “${truncate(e.text, 40)}” ${f(e.latency_ms)}`;
+    case 'localize_video':
+      return `${e.market} animatic ${Number(e.duration_s || 0).toFixed(1)} s`;
+    case 'voiceover_status':
+      return `${e.scene_id} ${e.status}${e.error ? ` · ${e.error}` : ''}`;
+    case 'voiceover':
+      return `${e.scene_id} take ${e.v ?? 1} “${truncate(e.text, 44)}” ${f(e.latency_ms)}`;
     case 'log':
       return `[${e.level || 'info'}] ${e.msg || ''}`;
     case 'error':
@@ -2078,6 +2752,7 @@ function logClass(e) {
   if (e.type.startsWith('variant') || e.type === 'anchor' || e.type.startsWith('localize')) return 'lv-image';
   if (e.type.startsWith('clip')) return 'lv-video';
   if (e.type.startsWith('music')) return 'lv-music';
+  if (e.type.startsWith('voiceover')) return 'lv-voice';
   if (e.type === 'judge' || e.type === 'winner' || e.type === 'plan' || e.type === 'direction') return 'lv-text';
   if (e.type.startsWith('final') || e.type === 'run_done') return 'lv-final';
   return 'lv-dim';
@@ -2282,9 +2957,7 @@ async function launch() {
     return;
   }
   const btn = $('#launch-btn');
-  launching = true;
-  btn.classList.add('busy');
-  setText($('.launch-label', btn), 'Launching…');
+  setLaunchBusy(btn, true);
   const input = {
     brief: text,
     brand: $('#brand-name').value.trim(),
@@ -2311,10 +2984,17 @@ async function launch() {
   } catch (err) {
     toast(`Launch failed: ${err.message}`, 'error');
   } finally {
-    launching = false;
-    btn.classList.remove('busy');
-    setText($('.launch-label', btn), 'Launch loop');
+    setLaunchBusy(btn, false);
   }
+}
+
+/** Busy state for the launch button: spinner + "Launching…", disabled and announced to AT. */
+function setLaunchBusy(btn, busy) {
+  launching = busy;
+  btn.disabled = busy;
+  btn.setAttribute('aria-busy', String(busy));
+  cls(btn, 'busy', busy);
+  setText($('.launch-label', btn), busy ? 'Launching…' : 'Launch loop');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2461,160 +3141,335 @@ class VoiceCapture {
 // 15. Presentation mode (fullscreen overlay, ←/→/Esc)
 // ═══════════════════════════════════════════════════════════════════════════
 
-const present = { open: false, idx: 0, slides: [] };
+/**
+ * Presenter state. `slides` are specs `{key, sig, kind, el, vo, hold}`; `vo` is a narration URL
+ * played on enter, `hold` the dwell time for slides without media. Auto-play advances when the
+ * slide's narration (or the film) ends, plus SLIDE_GAP_MS.
+ */
+const present = { open: false, idx: 0, slides: [], auto: true, audio: new Audio(), timer: null, enteredAt: 0, raf: 0, wasFullscreen: false };
 
-/** Build slides from the current state: title, storyboard, film, how-it-was-made, localization. */
-function buildSlides() {
-  const run = store.run;
+const BEAT_NAMES = { hook: 'Hook', build: 'Build', reveal: 'Reveal', cta: 'Call to action' };
+
+/**
+ * Slide specs from the current state: title → one slide per scene (clip + narration) → film →
+ * how it was made → one animatic slide per localized market. `sig` changes when a slide's
+ * content does, so `refreshPresentation` can rebuild just that slide while presenting.
+ */
+function slideSpecs(run) {
+  const plan = run.plan || {};
+  const specs = [{ key: 'title', kind: 'title', sig: `${plan.campaign_name}|${plan.tagline}`, hold: SLIDE_TIMED_MS, build: () => titleSlide(run) }];
+  run.scenes.forEach((s, i) => {
+    const clip = s.clip.versions[s.clip.versions.length - 1];
+    const vo = s.voiceover.url ? withBust(s.voiceover.url, s.voiceover.v) : null;
+    specs.push({
+      key: `scene:${s.id}`,
+      kind: 'scene',
+      sig: `${clip?.url}|${vo}|${s.voiceover.text}|${s.winner}`,
+      vo,
+      hold: SLIDE_TIMED_MS,
+      build: () => sceneSlide(run, s, i, clip),
+    });
+  });
+  const f = run.final;
+  specs.push({ key: 'film', kind: 'film', sig: `${f.url}|${f.version}|${f.captions_url}`, hold: SLIDE_TIMED_MS, build: () => filmSlide(run) });
+  // Campaign kit slide (static/posters.js plugin); skipped when the plugin isn't loaded or has no winners yet.
+  const kitItems = ((window.AdLoopPosters?.getState?.() || run.posters || {}).items || []).filter((it) => it.winner != null);
+  if (kitItems.length && window.AdLoopPosters?.renderSlide) {
+    specs.push({
+      key: 'kit', kind: 'kit', hold: SLIDE_TIMED_MS,
+      sig: `kit|${kitItems.map((it) => `${it.format}:${it.winner}`).join(',')}`,
+      build: () => { const el = h('section', { class: 'slide slide-kit' }); window.AdLoopPosters.renderSlide(el); return el; },
+    });
+  }
+  specs.push({ key: 'stats', kind: 'stats', sig: 'stats', hold: SLIDE_TIMED_MS + 2000, build: () => statsSlide(run) });
+  for (const [market, loc] of Object.entries(run.localizations)) {
+    if (!loc.video_url && !loc.scenes.some((x) => x.url)) continue;
+    specs.push({ key: `loc:${market}`, kind: 'loc', sig: `${loc.video_url}|${loc.scenes.length}|${loc.plan?.tagline}`, hold: SLIDE_TIMED_MS, build: () => locSlide(run, market, loc) });
+  }
+  return specs;
+}
+
+function titleSlide(run) {
   const plan = run.plan || {};
   const brand = plan.brand || {};
   const palette = (brand.palette || []).map(safeColor).filter(Boolean);
-  const m = metricsView(run);
-  const slides = [];
+  return h(
+    'section',
+    { class: 'slide slide-title', style: { '--p0': palette[0] || '#7c5cff', '--p1': palette[1] || '#ff4fd8', '--p2': palette[2] || '#ffb547' } },
+    h('div', { class: 'eyebrow mono' }, `${brand.name || run.input.brand || 'AdLoop'} · ${run.scenes.length} scenes · ${run.input.aspect}`),
+    h('h1', { class: 'grad-text' }, plan.campaign_name || 'Untitled campaign'),
+    plan.tagline ? h('p', { class: 'slide-tagline' }, `“${plan.tagline}”`) : null,
+    plan.cta ? h('span', { class: 'cta-chip big' }, plan.cta) : null,
+    h('div', { class: 'palette big' }, palette.map((c) => h('div', { class: 'swatch', style: { '--c': c } }, h('span', { class: 'mono' }, c.toUpperCase())))),
+  );
+}
 
-  slides.push(
+/** Full-bleed scene: its clip looping muted (or the keyframe with a slow push), label, judge score and a big narrated caption. */
+function sceneSlide(run, s, i, clip) {
+  const win = winnerVariant(s);
+  const still = safeUrl(win?.url || s.variants.find((v) => v.url)?.url || '');
+  const media = clip?.url
+    ? h('video', { class: 'scene-clip', src: safeUrl(clip.url), muted: true, loop: true, playsInline: true, preload: 'auto', poster: still || null })
+    : still
+      ? h('img', { class: 'scene-clip still', src: still, alt: '' })
+      : h('div', { class: 'scene-clip shimmer' });
+  const score = winnerScore(s);
+  const words = String(s.voiceover.text || '').split(/\s+/).filter(Boolean);
+  const beat = BEAT_NAMES[s.beat] || s.beat || '';
+  return h(
+    'section',
+    { class: `slide slide-scene${isPortrait(run) ? ' portrait' : ''}` },
+    still ? h('img', { class: 'scene-backdrop', src: still, alt: '' }) : null,
+    media,
+    h('div', { class: 'scene-shade' }),
     h(
-      'section',
-      { class: 'slide slide-title', style: { '--p0': palette[0] || '#7c5cff', '--p1': palette[1] || '#ff4fd8', '--p2': palette[2] || '#ffb547' } },
-      h('div', { class: 'eyebrow mono' }, `${brand.name || run.input.brand || 'AdLoop'} · ${run.input.aspect}`),
-      h('h1', { class: 'grad-text' }, plan.campaign_name || 'Untitled campaign'),
-      plan.tagline ? h('p', { class: 'slide-tagline' }, `“${plan.tagline}”`) : null,
-      plan.cta ? h('span', { class: 'cta-chip big' }, plan.cta) : null,
-      h('div', { class: 'palette big' }, palette.map((c) => h('div', { class: 'swatch', style: { '--c': c } }, h('span', { class: 'mono' }, c.toUpperCase())))),
+      'div',
+      { class: 'scene-top' },
+      h('span', { class: 'scene-label mono' }, `Scene ${i + 1}${beat ? ` · ${beat}` : ''}`),
+      score != null ? h('span', { class: 'scene-score mono', title: 'Flash vision-judge score of the winning keyframe' }, `♛ judge ${fmtScore(score)}`) : null,
+    ),
+    h(
+      'div',
+      { class: 'scene-bottom' },
+      h('div', { class: 'scene-kicker' }, s.title || ''),
+      words.length
+        ? h('p', { class: 'scene-caption' }, words.map((w) => h('span', { class: 'w' }, `${w} `)))
+        : h('p', { class: 'scene-caption muted-cap' }, s.mood || ''),
     ),
   );
+}
 
-  slides.push(
-    h(
-      'section',
-      { class: 'slide slide-board' },
-      h('h2', {}, 'Storyboard winners ', h('span', { class: 'muted' }, 'picked by the Flash vision judge')),
-      h(
-        'div',
-        { class: `board-grid ${isPortrait(run) ? 'portrait' : ''}` },
-        run.scenes.map((s, i) => {
-          const w = winnerVariant(s);
-          const sc = winnerScore(s);
-          const judge = s.judge[s.judge.length - 1];
-          return h(
-            'figure',
-            { class: 'board-card' },
-            h('div', { class: 'board-img' }, w?.url ? h('img', { src: safeUrl(w.url), alt: s.title || '' }) : h('div', { class: 'shimmer' }), sc != null ? h('span', { class: 'badge score mono' }, fmtScore(sc)) : null),
-            h('figcaption', {}, h('b', {}, `S${i + 1} · ${s.title || s.id}`), judge?.rationale ? h('span', { class: 'muted small' }, truncate(judge.rationale, 110)) : null),
-          );
-        }),
-      ),
-    ),
-  );
-
+function filmSlide(run) {
   const f = run.final;
-  const filmUrl = f.url ? `${f.url}${f.url.includes('?') ? '&' : '?'}v=${f.version || 0}` : null;
-  slides.push(
-    h(
-      'section',
-      { class: 'slide slide-film' },
-      filmUrl
-        ? h('video', { class: `film ${isPortrait(run) ? 'portrait' : ''}`, src: safeUrl(filmUrl), controls: true, playsInline: true, preload: 'auto' })
-        : h('div', { class: 'film-wait' }, h('div', { class: 'shimmer' }), h('p', {}, 'The final cut is still stitching…')),
-      h('p', { class: 'film-cap mono muted' }, filmUrl ? `Final cut v${f.version} · ${Number(f.duration_s || 0).toFixed(1)} s · Omni Flash clips + Lyria 3.5 score` : ''),
-    ),
+  const filmUrl = f.url ? withBust(f.url, f.version || 0) : null;
+  let body;
+  if (filmUrl) {
+    body = h('video', { class: `film ${isPortrait(run) ? 'portrait' : ''}`, src: safeUrl(filmUrl), controls: true, playsInline: true, preload: 'auto' });
+    setCaptions(body, f.captions_url ? withBust(f.captions_url, f.version) : null);
+  } else body = h('div', { class: 'film-wait' }, h('div', { class: 'shimmer' }), h('p', {}, 'The final cut is still stitching…'));
+  return h(
+    'section',
+    { class: 'slide slide-film' },
+    body,
+    h('p', { class: 'film-cap mono muted' }, filmUrl ? `Final cut v${f.version} · ${Number(f.duration_s || 0).toFixed(1)} s · Omni Flash clips · Lyria 3.5 score · Flash TTS narration` : ''),
   );
+}
 
+function statsSlide(run) {
+  const m = metricsView(run);
   const stat = (v, label) => h('div', { class: 'stat' }, h('b', { class: 'grad-text' }, v), h('span', {}, label));
-  slides.push(
+  return h(
+    'section',
+    { class: 'slide slide-stats' },
+    h('h2', {}, 'How it was made'),
     h(
-      'section',
-      { class: 'slide slide-stats' },
-      h('h2', {}, 'How it was made'),
-      h(
-        'div',
-        { class: 'stat-grid' },
-        stat(fmtMetric(m.images_generated, 'n'), 'NB2 keyframes generated'),
-        stat(fmtMetric(m.image_p50_ms, 'ms'), 'p50 Nano Banana 2 Lite latency'),
-        stat(fmtMetric(m.time_to_first_image_ms, 'ms'), 'time to first image'),
-        stat(fmtMetric(m.judge_calls, 'n'), 'vision-judge calls'),
-        stat(fmtMetric(m.repair_rounds, 'n'), 'self-repair rounds'),
-        stat(`${fmtMetric(m.videos_generated, 'n')} / ${fmtMetric(m.video_edits ?? 0, 'n')}`, 'Omni clips / edits'),
-        stat(fmtMetric(m.music_versions, 'n'), 'Lyria score versions'),
-        stat(fmtMetric(m.time_to_final_ms ?? m.wall_ms, 'ms'), 'brief → first final cut'),
-      ),
-      h('p', { class: 'muted mono small' }, `pipelined, not barriered · ${run.mode === 'live' ? 'live models' : 'mock mode'}`),
+      'div',
+      { class: 'stat-grid' },
+      stat(fmtMetric(m.images_generated, 'n'), 'NB2 keyframes generated'),
+      stat(fmtMetric(m.image_p50_ms, 'ms'), 'p50 Nano Banana 2 Lite latency'),
+      stat(fmtMetric(m.time_to_first_image_ms, 'ms'), 'time to first image'),
+      stat(`${fmtMetric(m.judge_calls, 'n')} / ${fmtMetric(m.repair_rounds ?? 0, 'n')}`, 'judge calls / self-repairs'),
+      stat(`${fmtMetric(m.videos_generated, 'n')} / ${fmtMetric(m.video_edits ?? 0, 'n')}`, 'Omni clips / edits'),
+      stat(fmtMetric(m.music_versions, 'n'), 'Lyria score versions'),
+      stat(`${fmtMetric(m.voiceovers_generated, 'n')}${m.tts_p50_ms ? ` · ${fmtMs(m.tts_p50_ms)}` : ''}`, 'narrated lines · TTS p50'),
+      stat(fmtMetric(m.time_to_final_ms ?? m.wall_ms, 'ms'), 'brief → first final cut'),
     ),
+    h('p', { class: 'muted mono small' }, `pipelined, not barriered · ${run.mode === 'live' ? 'live models' : 'mock mode'}`),
   );
+}
 
-  const locs = Object.entries(run.localizations).filter(([, l]) => l.scenes.length);
-  if (locs.length) {
-    slides.push(
-      h(
-        'section',
-        { class: 'slide slide-loc' },
-        h('h2', {}, 'One campaign, every market'),
-        h(
-          'div',
-          { class: 'loc-slide-grid' },
-          locs.map(([market, loc]) => {
-            const kv = loc.scenes.find((x) => x.url);
-            return h(
-              'figure',
-              { class: 'board-card' },
-              h('div', { class: `board-img ${isPortrait(run) ? 'portrait' : ''}` }, kv ? h('img', { src: safeUrl(kv.url), alt: market }) : null),
-              h('figcaption', {}, h('b', {}, market), loc.plan?.tagline ? h('span', { class: 'muted small' }, `“${loc.plan.tagline}”`) : null),
-            );
-          }),
-        ),
-      ),
+/** A localized market: its narrated animatic when rendered, else its keyframes. */
+function locSlide(run, market, loc) {
+  const p = loc.plan || {};
+  let media;
+  if (loc.video_url) {
+    media = h('video', { class: `film loc-film ${isPortrait(run) ? 'portrait' : ''}`, src: safeUrl(loc.video_url), controls: true, playsInline: true, preload: 'auto' });
+    setCaptions(media, loc.captions_url);
+  } else {
+    media = h(
+      'div',
+      { class: `board-grid ${isPortrait(run) ? 'portrait' : ''}` },
+      loc.scenes.filter((x) => x.url).map((x) => h('div', { class: `board-img ${isPortrait(run) ? 'portrait' : ''}` }, h('img', { src: safeUrl(x.url), alt: '' }))),
     );
   }
-  return slides;
+  return h(
+    'section',
+    { class: 'slide slide-loc' },
+    h('h2', {}, market, p.language ? h('span', { class: 'muted' }, ` · ${p.language}`) : null),
+    media,
+    p.tagline ? h('p', { class: 'slide-tagline loc-tagline' }, `“${p.tagline}”`) : null,
+  );
 }
 
 function openPresentation() {
-  if (!store.run?.plan) return toast('Nothing to present yet — wait for the plan.', 'warn');
-  present.slides = buildSlides();
+  const run = store.run;
+  if (!run?.plan) return toast('Nothing to present yet — wait for the plan.', 'warn');
+  // Only the presenter makes sound: silence every studio player first.
+  for (const m of $$('#final-panel video, #music-panel audio, .loc-audio, .loc-video')) m.pause();
+  voPreview.audio.pause();
+  present.slides = slideSpecs(run).map((sp) => ({ ...sp, el: sp.build() }));
   present.open = true;
   const overlay = $('#present');
   overlay.hidden = false;
-  $('#present-stage').replaceChildren(...present.slides);
-  $('#present-dots').replaceChildren(...present.slides.map((_, i) => h('button', { type: 'button', class: 'dot', dataset: { i: String(i) }, 'aria-label': `Slide ${i + 1}` })));
+  mountSlides();
   overlay.requestFullscreen?.().catch(() => {});
   showSlide(0);
+  present.raf = requestAnimationFrame(presentLoop);
+}
+
+/** (Re)mount slide elements and navigation dots. */
+function mountSlides() {
+  $('#present-stage').replaceChildren(...present.slides.map((sp) => sp.el));
+  $('#present-dots').replaceChildren(
+    ...present.slides.map((sp, i) => h('button', { type: 'button', class: `dot dot-${sp.kind}`, dataset: { i: String(i) }, 'aria-label': `Slide ${i + 1}` })),
+  );
+}
+
+/** While presenting, rebuild only the slides whose content changed (a new final version, a VO take landing…). */
+function refreshPresentation() {
+  if (!present.open || !store.run) return;
+  const specs = slideSpecs(store.run);
+  const cur = present.slides[present.idx]?.key;
+  const sameShape = specs.length === present.slides.length && specs.every((sp, i) => sp.key === present.slides[i].key);
+  if (!sameShape) {
+    present.slides = specs.map((sp) => present.slides.find((o) => o.key === sp.key && o.sig === sp.sig) || { ...sp, el: sp.build() });
+    mountSlides();
+    const i = present.slides.findIndex((sp) => sp.key === cur);
+    showSlide(i >= 0 ? i : present.idx, { restart: false });
+    return;
+  }
+  specs.forEach((sp, i) => {
+    const old = present.slides[i];
+    if (old.sig === sp.sig) return;
+    const next = { ...sp, el: sp.build() };
+    old.el.replaceWith(next.el);
+    present.slides[i] = next;
+    // Re-enter the visible slide only if it carries media (its film / narration just changed).
+    if (i === present.idx) showSlide(i, { restart: sp.kind !== 'stats' && sp.kind !== 'title' });
+    else cls(next.el, 'before', i < present.idx);
+  });
 }
 
 function closePresentation() {
   if (!present.open) return;
   present.open = false;
-  for (const v of $$('#present-stage video')) v.pause();
+  stopSlideMedia();
+  cancelAnimationFrame(present.raf);
   $('#present').hidden = true;
   $('#present-stage').replaceChildren();
+  present.slides = [];
   if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
 }
 
-function showSlide(i) {
+function stopSlideMedia() {
+  clearTimeout(present.timer);
+  present.timer = null;
+  present.audio.pause();
+  present.audio.onended = present.audio.onerror = null;
+  for (const v of $$('#present-stage video')) {
+    v.pause();
+    v.onended = null;
+  }
+}
+
+/** Schedule the auto-advance for the current slide (no-op on the last slide or with auto-play off). */
+function scheduleAdvance(ms) {
+  clearTimeout(present.timer);
+  present.timer = null;
+  if (!present.auto || present.idx >= present.slides.length - 1) return;
+  present.timer = setTimeout(() => showSlide(present.idx + 1), ms);
+}
+
+/**
+ * Enter slide `i`: stop the previous slide's media, start this one's (clip loop, narration,
+ * film with sound), and arm auto-advance on narration / film end (timed fallback without media).
+ */
+function showSlide(i, { restart = true } = {}) {
   const n = present.slides.length;
+  if (!n) return;
   present.idx = Math.max(0, Math.min(n - 1, i));
-  present.slides.forEach((s, k) => {
-    cls(s, 'active', k === present.idx);
-    cls(s, 'before', k < present.idx);
+  const spec = present.slides[present.idx];
+  present.slides.forEach((sp, k) => {
+    cls(sp.el, 'active', k === present.idx);
+    cls(sp.el, 'before', k < present.idx);
   });
   $$('#present-dots .dot').forEach((d, k) => cls(d, 'on', k === present.idx));
-  for (const v of $$('#present-stage video')) {
-    const onSlide = v.closest('.slide') === present.slides[present.idx];
-    if (onSlide) {
-      v.muted = false;
-      v.currentTime = 0;
-      v.play?.().catch(() => {
-        // Autoplay with sound refused: fall back to muted so the film still moves.
-        v.muted = true;
-        v.play?.().catch(() => {});
-      });
-    } else v.pause();
+  setText($('#present-count'), `${present.idx + 1} / ${n}`);
+  if (!restart) return;
+  stopSlideMedia();
+  present.enteredAt = performance.now();
+  present.media = null;
+  for (const w of $$('.scene-caption .w', spec.el)) w.classList.remove('lit');
+
+  const clip = $('video.scene-clip', spec.el);
+  if (clip) {
+    clip.muted = true;
+    clip.currentTime = 0;
+    clip.play?.().catch(() => {});
   }
+  if (spec.kind === 'scene') {
+    if (!spec.vo) return scheduleAdvance(spec.hold);
+    const a = present.audio;
+    a.src = spec.vo;
+    a.currentTime = 0;
+    present.media = a;
+    a.onended = () => scheduleAdvance(SLIDE_GAP_MS);
+    a.onerror = () => scheduleAdvance(spec.hold);
+    // A short lead-in so the slide transition lands before the first word.
+    present.timer = setTimeout(() => a.play().catch(() => scheduleAdvance(spec.hold)), 350);
+    return;
+  }
+  const film = $('video.film', spec.el);
+  if (film) {
+    present.media = film;
+    film.muted = false;
+    film.currentTime = 0;
+    film.onended = () => scheduleAdvance(SLIDE_GAP_MS);
+    film.play?.().catch(() => {
+      // Autoplay with sound refused: fall back to muted so the film still moves.
+      film.muted = true;
+      film.play?.().catch(() => {});
+    });
+    return;
+  }
+  scheduleAdvance(spec.hold);
+}
+
+/** Per-frame presenter UI: the progress bar and the word-by-word caption highlight. */
+function presentLoop() {
+  if (!present.open) return;
+  const spec = present.slides[present.idx];
+  const m = present.media;
+  let p;
+  if (m) p = Number.isFinite(m.duration) && m.duration > 0 ? m.currentTime / m.duration : 0;
+  else p = present.auto ? (performance.now() - present.enteredAt) / (spec?.hold || SLIDE_TIMED_MS) : 0;
+  $('#present-progress').style.width = `${(Math.max(0, Math.min(1, p)) * 100).toFixed(1)}%`;
+  if (spec?.kind === 'scene' && m === present.audio) {
+    const words = $$('.scene-caption .w', spec.el);
+    const lit = Math.ceil(p * words.length);
+    words.forEach((w, k) => cls(w, 'lit', k < lit));
+  }
+  present.raf = requestAnimationFrame(presentLoop);
+}
+
+function setPresentAuto(on) {
+  present.auto = on;
+  const b = $('#present-auto');
+  b.setAttribute('aria-pressed', String(on));
+  setText(b, on ? '⏵ Auto-play' : '⏸ Manual');
+  if (!present.open) return;
+  if (!on) {
+    clearTimeout(present.timer);
+    present.timer = null;
+  } else if (!present.media || present.media.ended) scheduleAdvance(present.slides[present.idx]?.hold || SLIDE_TIMED_MS);
 }
 
 function initPresentation() {
   $('#present-prev').addEventListener('click', () => showSlide(present.idx - 1));
   $('#present-next').addEventListener('click', () => showSlide(present.idx + 1));
   $('#present-close').addEventListener('click', closePresentation);
+  $('#present-auto').addEventListener('click', () => setPresentAuto(!present.auto));
+  setPresentAuto(true);
   $('#present-dots').addEventListener('click', (ev) => {
     const d = ev.target.closest('.dot');
     if (d) showSlide(Number(d.dataset.i));
@@ -2646,6 +3501,20 @@ async function loadHealth() {
   } catch {
     setText(badge, '● OFFLINE');
     badge.dataset.mode = 'offline';
+  }
+}
+
+/** Disable the "Watch sample run" buttons (with a reason) when the server has no finished run to replay. */
+async function checkShowcase() {
+  try {
+    const res = await api('/api/showcase');
+    const none = !res?.run_id;
+    for (const b of [$('#sample-btn'), $('#hero-sample')]) {
+      cls(b, 'sample-none', none);
+      b.title = none ? 'No finished sample run on this server yet: launch one first' : `Replay run ${res.run_id} at ${REPLAY_SPEED}× speed`;
+    }
+  } catch {
+    /* health badge already reports an offline server */
   }
 }
 
@@ -2712,9 +3581,31 @@ function initGlobal() {
     markDirty();
     $('#brief-text').focus();
   });
-  const toggleTele = () => document.body.classList.toggle('tele-closed');
+  // Telemetry drawer: closed by default; an explicit open/close is remembered across reloads.
+  const setTele = (open, persist = true) => {
+    document.body.classList.toggle('tele-closed', !open);
+    $('#telemetry-toggle').setAttribute('aria-expanded', String(open));
+    if (persist) {
+      try {
+        localStorage.setItem(TELE_KEY, open ? 'open' : 'closed');
+      } catch {
+        /* storage unavailable (private mode): the choice just is not remembered */
+      }
+    }
+  };
+  const toggleTele = () => setTele(document.body.classList.contains('tele-closed'));
   $('#telemetry-toggle').addEventListener('click', toggleTele);
-  if (window.innerWidth < 1480) document.body.classList.add('tele-closed');
+  let saved = null;
+  try {
+    saved = localStorage.getItem(TELE_KEY);
+  } catch {
+    saved = null;
+  }
+  setTele(saved === 'open', false);
+  $('#dir-fanout').addEventListener('click', onFanoutClick);
+  $('#dir-input').addEventListener('keydown', (ev) => {
+    if (cancelSpokenDirection() && ev.key === 'Escape') ev.preventDefault();
+  });
   $('#log-clear').addEventListener('click', () => $('#event-log').replaceChildren());
 
   $('#dir-form').addEventListener('submit', (ev) => {
@@ -2734,24 +3625,24 @@ function initGlobal() {
   new VoiceCapture({
     button: $('#dir-mic'),
     meter: $('#dir-meter'),
-    onText: (t) => {
-      $('#dir-input').value = t;
-      $('#dir-input').focus();
-    },
+    onText: queueSpokenDirection,
   });
 
   document.addEventListener('keydown', (ev) => {
     if (present.open) {
-      if (ev.key === 'ArrowRight' || ev.key === 'PageDown') showSlide(present.idx + 1);
+      if (ev.key === 'ArrowRight' || ev.key === 'PageDown' || ev.key === ' ') showSlide(present.idx + 1);
       else if (ev.key === 'ArrowLeft' || ev.key === 'PageUp') showSlide(present.idx - 1);
       else if (ev.key === 'Escape') closePresentation();
+      else if (ev.key === 'a' || ev.key === 'A') setPresentAuto(!present.auto);
       else return;
       ev.preventDefault();
       return;
     }
+    if (ev.key === 'Escape' && cancelSpokenDirection()) return;
     const typing = ev.target.closest?.('input, textarea, [contenteditable]');
-    if (typing) return;
+    if (typing || ev.metaKey || ev.ctrlKey || ev.altKey) return;
     if (ev.key === 't' || ev.key === 'T') toggleTele();
+    else if (ev.key === 'b' || ev.key === 'B') document.body.classList.toggle('big-screen');
     else if ((ev.key === 'p' || ev.key === 'P') && store.run?.plan) openPresentation();
   });
 
@@ -2764,11 +3655,19 @@ function initGlobal() {
   }, 200);
 }
 
+/** Attach the web fonts without blocking first paint (system fallbacks render meanwhile / offline). */
+function loadFonts() {
+  document.head.appendChild(h('link', { rel: 'stylesheet', href: FONTS_URL }));
+}
+
 function boot() {
+  loadFonts();
+  initScrollTracking();
   initBriefPanel();
   initPresentation();
   initGlobal();
   loadHealth();
+  checkShowcase();
   const id = hashRunId();
   if (id) openRun(id);
   markDirty();

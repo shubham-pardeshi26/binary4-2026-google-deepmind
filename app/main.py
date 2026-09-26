@@ -1,6 +1,6 @@
 """AdLoop HTTP server (FastAPI): studio page, media files, run API, SSE event streams.
 
-Endpoints follow CONTRACT §7. Design notes:
+Endpoints follow CONTRACT §7 (+ the §9c per-scene voiceover action). Design notes:
 
 * **Non-blocking actions** -- every mutating endpoint validates its input, schedules background work on the
   :class:`~app.pipeline.Run` and returns ``{"ok": true}`` immediately; progress is streamed as events.
@@ -37,7 +37,7 @@ from app import media
 from app.config import settings
 from app.events import CLOSED, sse_format
 from app.genai_client import GenAIError, GenMedia
-from app.pipeline import MAX_INSTRUCTION_CHARS, RunManager, valid_run_id
+from app.pipeline import MAX_INSTRUCTION_CHARS, MAX_VOICEOVER_CHARS, RunManager, valid_run_id
 
 log = logging.getLogger("adloop.main")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -60,7 +60,7 @@ _PRIVATE_FILES = frozenset({"run.json", "events.jsonl"})
 
 for _ext, _mime in ((".mp4", "video/mp4"), (".webm", "video/webm"), (".mp3", "audio/mpeg"), (".wav", "audio/wav"),
                     (".m4a", "audio/mp4"), (".webp", "image/webp"), (".js", "text/javascript"),
-                    (".css", "text/css"), (".jsonl", "application/x-ndjson")):
+                    (".css", "text/css"), (".jsonl", "application/x-ndjson"), (".vtt", "text/vtt")):
     mimetypes.add_type(_mime, _ext)
 
 
@@ -335,6 +335,11 @@ class RequiredInstructionBody(BaseModel):
     instruction: str = Field(..., min_length=1, max_length=MAX_INSTRUCTION_CHARS)
 
 
+class VoiceoverBody(BaseModel):
+    text: str | None = Field(None, max_length=MAX_VOICEOVER_CHARS)
+    voice: str | None = Field(None, max_length=40, pattern=r"^[A-Za-z][A-Za-z -]{0,39}$")
+
+
 class LocalizeBody(BaseModel):
     markets: list[str] = Field(..., min_length=1, max_length=MAX_MARKETS)
 
@@ -385,6 +390,19 @@ async def edit_scene(request: Request, run_id: str, scene_id: str, body: Require
     if not instruction:
         return err(400, "instruction is required")
     run.action_edit(scene_id, instruction)
+    return OK
+
+
+@app.post("/api/runs/{run_id}/scenes/{scene_id}/voiceover")
+async def revoice_scene(request: Request, run_id: str, scene_id: str, body: VoiceoverBody | None = None):
+    """Re-voice one scene's narration (optionally new words and/or narrator) -> automatic re-stitch."""
+    run = _run_or_404(request, run_id)
+    if (bad := _scene_or_error(run, scene_id)) is not None:
+        return bad
+    text = _clean(body.text if body else None)
+    if text is None and not ((run.scene(scene_id).get("voiceover") or {}).get("text")):
+        return err(400, "this scene has no narration line yet — send one in \"text\"")
+    run.action_voiceover(scene_id, text, _clean(body.voice if body else None))
     return OK
 
 
