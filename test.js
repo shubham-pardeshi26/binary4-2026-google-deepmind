@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { tasteFrom, STYLES, limit, findMedia } from './server.js';
+import { tasteFrom, STYLES, limit, findMedia, redact } from './server.js';
 
 assert.equal(STYLES.length, 20);
 assert.equal(new Set(STYLES.map(s => s.pose)).size, 20, 'every preset has its own pose');
@@ -22,10 +22,10 @@ await Promise.all(Array.from({ length: 10 }, (_, i) => slot(async () => {
 }).catch(() => {})));
 assert.equal(peak, 3, 'limiter caps concurrency, and a failing task releases its slot');
 
-// Response shapes the video/music models might use.
-assert.deepEqual(findMedia({ candidates: [{ content: { parts: [{ text: 'hi' }, { inlineData: { mimeType: 'video/mp4', data: 'AAA' } }] } }] }), { mimeType: 'video/mp4', data: 'AAA' });
-assert.deepEqual(findMedia({ predictions: [{ bytesBase64Encoded: 'BBB', mimeType: 'audio/wav' }] }), { mimeType: 'audio/wav', data: 'BBB' });
-assert.equal(findMedia({ response: { generateVideoResponse: { generatedSamples: [{ video: { uri: 'https://x.googleapis.com/v1/files/a:download' } }] } } }).uri, 'https://x.googleapis.com/v1/files/a:download');
-assert.equal(findMedia({ candidates: [{ content: { parts: [{ fileData: { mimeType: 'video/mp4', fileUri: 'https://g/f' } }] } }] }).uri, 'https://g/f');
-assert.equal(findMedia({ candidates: [{ content: { parts: [{ text: 'no media' }] } }] }), null);
+// generateContent (images) and Interactions (video / music) response shapes.
+assert.deepEqual(findMedia({ candidates: [{ content: { parts: [{ text: 'hi' }, { inlineData: { mimeType: 'image/png', data: 'AAA' } }] } }] }), { mimeType: 'image/png', data: 'AAA' });
+assert.deepEqual(findMedia({ id: 'i1', steps: [{ type: 'thought' }, { type: 'model_output', content: [{ type: 'text', text: 'lyrics' }, { type: 'audio', mime_type: 'audio/mpeg', data: 'BBB' }] }] }), { mimeType: 'audio/mpeg', data: 'BBB', uri: undefined });
+assert.equal(findMedia({ outputs: [{ type: 'video', uri: 'https://generativelanguage.googleapis.com/v1beta/files/abc' }] }).uri, 'https://generativelanguage.googleapis.com/v1beta/files/abc');
+assert.equal(findMedia({ steps: [{ type: 'model_output', content: [{ type: 'text', text: 'sorry' }] }] }), null);
+assert.ok(!redact({ data: 'x'.repeat(5000) }).includes('xxxx'), 'redact hides base64 blobs');
 console.log('ok');

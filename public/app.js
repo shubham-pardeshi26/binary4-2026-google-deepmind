@@ -1,5 +1,5 @@
 const $ = s => document.querySelector(s);
-const S = { source: null, batch: [], round: 1, liked: [], disliked: [], deck: 0, pick: null, edits: [], music: null, muted: false, busy: false, ctl: null, reelRun: 0, slate: null };
+const S = { source: null, batch: [], round: 1, liked: [], disliked: [], deck: 0, pick: null, edits: [], music: null, muted: false, busy: false, ctl: null, reelRun: 0, reelId: null, slate: null };
 let images = 0, actx, stopAudio = () => {};
 
 const show = id => document.querySelectorAll('main > section').forEach(s => (s.hidden = s.id !== id));
@@ -216,6 +216,7 @@ $('#toReel').onclick = () => {
   actx ??= new AudioContext(); // must be created inside the click for autoplay rules
   actx.resume();
   S.edits = [];
+  S.reelId = null;
   reel();
 };
 
@@ -228,12 +229,15 @@ async function reel() {
   $('.screen').classList.add('loading');
   const label = S.edits.length ? `edit ${S.edits.length}…` : 'rendering…';
   await Promise.all([
-    step('omni', label, post('/api/reel', { image: src || S.source, style, edits: S.edits }), (_, s) => `${s}s`).then(v => run === S.reelRun && showVideo(v)),
-    step('lyria', 'scoring…', post('/api/music', { style, edits: S.edits }), (_, s) => `${s}s`).then(m => run === S.reelRun && playMusic(m)),
+    // prevId → Omni edits its previous take ("keep everything else the same") instead of starting over.
+    step('omni', label, post('/api/reel', { image: src || S.source, style, edits: S.edits, prevId: S.edits.length ? S.reelId : null }), (_, s) => `${s}s`)
+      .then(v => run === S.reelRun && showVideo(v)),
+    step('lyria', 'scoring…', post('/api/music', { image: src || S.source, style, edits: S.edits }), (_, s) => `${s}s`).then(m => run === S.reelRun && playMusic(m)),
   ]).catch(e => { if (run === S.reelRun) $('.screen').classList.remove('loading'); throw e; });
 }
 
 function showVideo(v) {
+  S.reelId = v.id;
   const screen = $('.screen');
   screen.classList.remove('loading');
   if (v.src) screen.replaceChildren(make('video', { src: v.src, autoplay: true, loop: true, muted: true, playsInline: true, controls: true }));

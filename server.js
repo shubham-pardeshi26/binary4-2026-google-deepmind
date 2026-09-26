@@ -70,8 +70,9 @@ const LOOKS = [
 const role = s => s.name.split(' · ')[0];
 export const prompts = {
   image: s => `Create a new professional ${role(s)} casting headshot of the person in this photo: ${s.desc}. Pose: ${s.pose}. Preserve their exact face, identity, age, skin tone and features. Change the pose, wardrobe, lighting, background and expression to match. Photorealistic 85mm portrait, casting quality.`,
-  video: (s, edits) => [`Casting reel of this exact person as a ${role(s)} type (${s.desc}): they face camera, turn to show left and right profiles, then give a natural smile and a serious take. Keep their identity exactly.`, ...edits.map(e => `Direction: ${e}.`)].join(' '),
-  music: (s, edits) => [`Subtle instrumental underscore for an actor's ${role(s)} casting reel (${s.tags.join(', ')}), ${s.mood.major ? 'warm, major key' : 'tense, minor key'}, unobtrusive, no vocals, about 20 seconds.`, ...edits.map(e => `Mood direction: ${e}.`)].join(' '),
+  video: (s, edits) => [`In a single continuous shot, no scene cuts: a casting reel of this exact person as a ${role(s)} type (${s.desc}). They face the camera, slowly turn to show their left and right profiles, then give a natural smile followed by a serious take. Keep their face and identity exactly as in the image. No speech, no music.`, ...edits.map(e => `Direction: ${e}.`)].join(' '),
+  edit: e => `${e}. Keep everything else the same.`,
+  music: (s, edits) => [`Subtle instrumental underscore for an actor's ${role(s)} casting reel (${s.tags.join(', ')}), ${s.mood.major ? 'warm, major key' : 'tense, minor key'}, inspired by the mood of this headshot, unobtrusive. Instrumental only, no vocals. About 30 seconds.`, ...edits.map(e => `Mood direction: ${e}.`)].join(' '),
 };
 
 // Counts liked (+1) and passed (-1) tags, ranks the unpassed types by that score, and returns
@@ -103,6 +104,7 @@ function applyEdits(style, edits) {
 }
 
 // ---------- Gemini API ----------
+// Images: generateContent (NB2). Video + music: the Interactions API (POST /v1beta/interactions).
 
 export const limit = (n, queue = []) => async fn => {
   if (n <= 0) await new Promise(r => queue.push(r));
@@ -118,15 +120,12 @@ async function callApi(path, body) {
     body: body && JSON.stringify(body),
   }).catch(e => { throw new Error(`can't reach Gemini API (${e.cause?.code || e.cause?.message || e.message})`); });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(`${path.split(':')[0]}: ${j.error?.message || `HTTP ${r.status}`}`);
+  if (!r.ok) throw new Error(`${path.split(/[:/]/)[0]}: ${j.error?.message || `HTTP ${r.status}`}`);
   return j;
 }
 
-// Ask the API how each model is called instead of hard-coding it (no docs for Omni / Lyria yet).
-const methods = {};
-const methodsOf = model => (methods[model] ??= callApi(`models/${model}`)
-  .then(m => m.supportedGenerationMethods ?? [])
-  .catch(e => { delete methods[model]; throw e; }));
+// Replaces base64 blobs with their size so responses can be logged / shown in errors.
+export const redact = j => JSON.stringify(j, (k, v) => (typeof v === 'string' && v.length > 200 ? `<${v.length} chars>` : v));
 
 const inline = dataUrl => {
   const [, mimeType, data] = dataUrl?.match(/^data:(.+?);base64,(.+)$/) ?? [];
@@ -134,14 +133,12 @@ const inline = dataUrl => {
   return { mimeType, data };
 };
 
-// Finds the first media payload anywhere in a response; covers generateContent (inlineData / fileData)
-// and predict-style (bytesBase64Encoded / video.uri) shapes.
+// First media payload anywhere in a response: generateContent parts (inlineData) or
+// Interactions content blocks ({ type: 'video' | 'audio' | 'image', data | uri, mime_type }).
 export function findMedia(o) {
   if (!o || typeof o !== 'object') return null;
   if (o.inlineData?.data) return { mimeType: o.inlineData.mimeType, data: o.inlineData.data };
-  if (o.bytesBase64Encoded) return { mimeType: o.mimeType, data: o.bytesBase64Encoded };
-  if (o.fileData?.fileUri) return { mimeType: o.fileData.mimeType, uri: o.fileData.fileUri };
-  if (typeof o.uri === 'string' && /^https:/.test(o.uri)) return { mimeType: o.mimeType, uri: o.uri };
+  if (/^(image|audio|video)$/.test(o.type) && (o.data || o.uri)) return { mimeType: o.mime_type || o.mimeType, data: o.data, uri: o.uri };
   for (const v of Object.values(o)) {
     const m = findMedia(v);
     if (m) return m;
@@ -149,26 +146,16 @@ export function findMedia(o) {
   return null;
 }
 
-function checkBlocked(j) {
-  if (j.promptFeedback?.blockReason) throw new Error(`input refused (${j.promptFeedback.blockReason}): public-figure photos are blocked; use your own photo`);
-  const c = j.candidates?.[0];
-  if (c && !c.content?.parts) {
-    console.warn('blocked:', JSON.stringify({ finishReason: c.finishReason, finishMessage: c.finishMessage, safetyRatings: c.safetyRatings }));
-    throw new Error(`blocked: ${[c.finishReason, c.finishMessage].filter(Boolean).join(' · ')}`);
-  }
-}
-
-async function poll(name, timeoutMs = 6 * 60e3) {
-  for (const t0 = Date.now(); Date.now() - t0 < timeoutMs; await sleep(4000)) {
-    const op = await callApi(name);
-    if (op.error) throw new Error(op.error.message);
-    if (op.done) return op;
-  }
-  throw new Error('timed out after 6 min');
-}
-
 async function download(uri, mimeType) {
-  // Only Google hosts get the key; redirects are followed manually so the key never leaks to the target.
+  // Files API result: wait for ACTIVE, then fetch the bytes. Only Google hosts ever get the key.
+  const name = uri.match(/files\/([^/:?]+)/)?.[1];
+  if (name) {
+    for (let i = 0; (await callApi(`files/${name}`)).state !== 'ACTIVE'; i++) {
+      if (i > 60) throw new Error('video file never became ACTIVE');
+      await sleep(3000);
+    }
+    uri = uri.includes(':download') ? uri : `${API}/files/${name}:download?alt=media`;
+  }
   const google = new URL(uri).hostname.endsWith('.googleapis.com');
   let r = await fetch(uri, { headers: google ? { 'x-goog-api-key': KEY } : {}, redirect: 'manual' });
   if (r.status >= 300 && r.status < 400) r = await fetch(r.headers.get('location'));
@@ -177,49 +164,76 @@ async function download(uri, mimeType) {
   return `data:${type};base64,${Buffer.from(await r.arrayBuffer()).toString('base64')}`;
 }
 
-async function generate(model, { prompt, image, modalities, fallbackType }) {
-  const supported = await methodsOf(model);
-  const img = image && inline(image);
-  let j;
-  if (supported.includes('generateContent')) {
-    const parts = [...(img ? [{ inlineData: img }] : []), { text: prompt }];
-    j = await callApi(`models/${model}:generateContent`, { contents: [{ parts }], generationConfig: { responseModalities: modalities } });
-    checkBlocked(j);
-  } else {
-    const method = ['predictLongRunning', 'predict'].find(m => supported.includes(m));
-    if (!method) throw new Error(`${model} only supports: ${supported.join(', ') || 'nothing'}; tell Claude`);
-    j = await callApi(`models/${model}:${method}`, { instances: [{ prompt, ...(img && { image: { bytesBase64Encoded: img.data, mimeType: img.mimeType } }) }] });
-    if (method === 'predictLongRunning') j = await poll(j.name);
-  }
+async function toSrc(j, fallbackType, label) {
   const m = findMedia(j);
-  if (!m) {
-    const text = j.candidates?.[0]?.content?.parts?.map(p => p.text).filter(Boolean).join(' ');
-    throw new Error(`${model} returned no media: ${(text || JSON.stringify(j)).slice(0, 200)}`);
-  }
-  return m.uri ? download(m.uri, m.mimeType) : `data:${m.mimeType || fallbackType};base64,${m.data}`;
+  if (m?.data) return `data:${m.mimeType || fallbackType};base64,${m.data}`;
+  if (m?.uri) return download(m.uri, m.mimeType || fallbackType);
+  console.warn(`${label} returned no media:`, redact(j).slice(0, 2000));
+  throw new Error(`${label} returned no media: ${redact(j).slice(0, 300)}`);
 }
+
+async function generateImage(prompt, image) {
+  const j = await callApi(`models/${MODELS.image}:generateContent`, {
+    contents: [{ parts: [{ inlineData: inline(image) }, { text: prompt }] }],
+    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
+  });
+  if (j.promptFeedback?.blockReason) throw new Error(`input refused (${j.promptFeedback.blockReason}): public-figure photos are blocked; use your own photo`);
+  const c = j.candidates?.[0];
+  if (!c?.content?.parts) {
+    console.warn('image blocked:', redact({ finishReason: c?.finishReason, finishMessage: c?.finishMessage, safetyRatings: c?.safetyRatings }));
+    throw new Error(`blocked: ${[c?.finishReason, c?.finishMessage].filter(Boolean).join(' · ') || 'no content'}`);
+  }
+  return toSrc(j, 'image/png', MODELS.image);
+}
+
+// ponytail: assumes synchronous interactions; polls only if the API reports it's still running.
+async function interact(body) {
+  let j = await callApi('interactions', body);
+  for (const t0 = Date.now(); /progress|pending|queued|running/i.test(j.status ?? ''); ) {
+    if (Date.now() - t0 > 6 * 60e3) throw new Error('timed out after 6 min');
+    await sleep(4000);
+    j = await callApi(`interactions/${j.id}`);
+  }
+  if (/fail|cancel/i.test(j.status ?? '')) throw new Error(`${body.model} ${j.status}: ${redact(j.error ?? j).slice(0, 300)}`);
+  return j;
+}
+
+const block = dataUrl => { const { mimeType, data } = inline(dataUrl); return { type: 'image', mime_type: mimeType, data }; };
+const VIDEO_FORMAT = { type: 'video', aspect_ratio: '16:9', resolution: '720p' };
 
 const live = {
   mock: false,
   async stage(image, style) {
     const prompt = prompts.image(style);
-    return { src: await imageSlot(() => generate(MODELS.image, { prompt, image, modalities: ['TEXT', 'IMAGE'], fallbackType: 'image/png' })), prompt };
+    return { src: await imageSlot(() => generateImage(prompt, image)), prompt };
   },
-  async reel(image, style, edits) {
-    const prompt = prompts.video(style, edits);
-    return { src: await generate(MODELS.video, { prompt, image, modalities: ['VIDEO'], fallbackType: 'video/mp4' }), prompt };
+  // First take: headshot + full direction. Later takes: Omni's stateful edit of the previous video.
+  async reel(image, style, edits, prevId) {
+    const edit = prevId && edits.at(-1);
+    const prompt = edit ? prompts.edit(edit) : prompts.video(style, edits);
+    const j = await interact({
+      model: MODELS.video,
+      ...(edit ? { previous_interaction_id: prevId, input: prompt } : { input: [block(image), { type: 'text', text: prompt }] }),
+      response_format: VIDEO_FORMAT,
+    });
+    return { src: await toSrc(j, 'video/mp4', MODELS.video), id: j.id, prompt };
   },
-  async music(style, edits) {
+  // The headshot itself goes to Lyria so the score is derived from the image, not just the tags.
+  async music(image, style, edits) {
     const prompt = prompts.music(style, edits);
-    return { src: await generate(MODELS.music, { prompt, modalities: ['AUDIO'], fallbackType: 'audio/wav' }), prompt };
+    const j = await interact({ model: MODELS.music, input: [{ type: 'text', text: prompt }, ...(image ? [block(image)] : [])] });
+    return { src: await toSrc(j, 'audio/mpeg', MODELS.music), prompt };
   },
 };
 
 const mock = {
   mock: true,
   async stage(image, style) { await sleep(jitter(700, 2200)); return { src: null, prompt: prompts.image(style) }; },
-  async reel(image, style, edits) { await sleep(jitter(2500, 4000)); return { src: null, ...applyEdits(style, edits), prompt: prompts.video(style, edits) }; },
-  async music(style, edits) { await sleep(jitter(1200, 2000)); return { src: null, mood: applyEdits(style, edits).mood, prompt: prompts.music(style, edits) }; },
+  async reel(image, style, edits, prevId) {
+    await sleep(jitter(2500, 4000));
+    return { src: null, id: 'mock', ...applyEdits(style, edits), prompt: prevId && edits.length ? prompts.edit(edits.at(-1)) : prompts.video(style, edits) };
+  },
+  async music(image, style, edits) { await sleep(jitter(1200, 2000)); return { src: null, mood: applyEdits(style, edits).mood, prompt: prompts.music(style, edits) }; },
 };
 
 const ai = LIVE ? live : mock;
@@ -258,8 +272,8 @@ async function stage(req, res) {
 const routes = {
   'GET /api/config': async () => ({ mock: ai.mock }),
   'POST /api/taste': async ({ liked, disliked }) => tasteFrom(liked, disliked),
-  'POST /api/reel': async ({ image, style, edits = [] }) => ai.reel(image, style, edits),
-  'POST /api/music': async ({ style, edits = [] }) => ai.music(style, edits),
+  'POST /api/reel': async ({ image, style, edits = [], prevId }) => ai.reel(image, style, edits, prevId),
+  'POST /api/music': async ({ image, style, edits = [] }) => ai.music(image, style, edits),
 };
 
 async function serveStatic(req, res) {

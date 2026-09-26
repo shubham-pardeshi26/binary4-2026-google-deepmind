@@ -1,0 +1,7 @@
+.env
+node_modules/
+*.jpg
+*.jpeg
+*.png
+*.heic
+.git
