@@ -1,0 +1,30 @@
+# Render Blueprint for AdMate (Docker runtime).
+# Render looks for render.yaml at the repo root by default: either copy this
+# file there, or set "Blueprint Path" to deploy/render.yaml when creating the
+# Blueprint in the dashboard. See deploy/DEPLOY.md section (c).
+services:
+  - type: web
+    name: admate
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: standard            # 2 GB RAM: ffmpeg stitching + parallel media buffers
+    region: singapore         # closest Render region to Hyderabad
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false           # prompted for in the dashboard; never committed
+      - key: ADMATE_MOCK
+        value: "0"
+      - key: ADMATE_MAX_CONCURRENT_RUNS
+        value: "2"
+      - key: ADMATE_RUNS_PER_IP_PER_HOUR
+        value: "4"
+      - key: ADMATE_SHOWCASE_RUN
+        sync: false           # optional: run id to replay for "Watch sample run"
+    # Optional: persist runs across deploys (paid plans only).
+    # disk:
+    #   name: admate-data
+    #   mountPath: /app/data
+    #   sizeGB: 5

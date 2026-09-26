@@ -1,0 +1,26 @@
+# Secrets — never bake the API key into an image.
+.env
+.env.*
+!.env.example
+
+# Local environments / caches
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data (runs, smoke outputs, benchmarks) is created inside the container.
+data/
+
+# VCS / editor / OS noise
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+*.log
