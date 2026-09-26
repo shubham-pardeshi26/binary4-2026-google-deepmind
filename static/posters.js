@@ -574,7 +574,7 @@ function mount() {
   r.head = h(
     'div',
     { class: 'section-head pk-head' },
-    h('h2', {}, h('span', { class: 'step-no' }, 'KIT'), 'Campaign Kit ', h('span', { class: 'muted small pro-only' }, '— Nano Banana 2 Lite · print · social · web'), h('span', { class: 'muted small simple-only' }, '— posters for social, print and web')),
+    h('h2', {}, h('span', { class: 'step-no pro-only' }, 'KIT'), 'Campaign Kit ', h('span', { class: 'muted small pro-only' }, '— Nano Banana 2 Lite · print · social · web'), h('span', { class: 'muted small simple-only' }, '— posters for social, print and web')),
     h('div', { class: 'pk-head-right' }, r.chip, h('span', { class: 'pro-only' }, r.counter), r.zip),
   );
 
@@ -630,8 +630,8 @@ function buildCard(it) {
   c.label = h('b', { class: 'pk-label' });
   c.ar = h('span', { class: 'pk-ar mono' });
   c.variants = h('div', { class: 'pk-variants', role: 'group', 'aria-label': 'Variants — click to make one the winner' });
-  c.regen = h('button', { type: 'button', class: 'btn xs ghost pk-regen', title: 'Make another version of this poster' }, '↻ Make another version');
-  c.dl = h('a', { class: 'btn xs ghost pk-dl', href: '#', download: `poster_${it.format}.png`, hidden: true }, '⬇ Download');
+  c.regen = h('button', { type: 'button', class: 'btn xs ghost pk-regen', title: 'Make another version of this poster' }, h('span', { class: 'pk-ico', 'aria-hidden': 'true' }, '↻'), h('span', { class: 'pk-btn-lbl' }, 'New version'));
+  c.dl = h('a', { class: 'btn xs ghost pk-dl', href: '#', download: `poster_${it.format}.png`, hidden: true, title: 'Download this poster' }, h('span', { class: 'pk-ico', 'aria-hidden': 'true' }, '⬇'), h('span', { class: 'pk-btn-lbl' }, 'Download'));
   c.input = h('input', { type: 'text', maxlength: '300', placeholder: 'Optional: what should change?', 'aria-label': 'What should change on this poster' });
   c.form = h('form', { class: 'pk-regen-form', autocomplete: 'off', hidden: true }, c.input, h('button', { type: 'submit', class: 'btn xs grad' }, 'Go'));
   c.regen.addEventListener('click', () => {
@@ -658,7 +658,8 @@ function buildCard(it) {
     'div',
     { class: 'pk-meta' },
     h('div', { class: 'pk-title' }, c.label, c.ar),
-    h('div', { class: 'pk-actions' }, c.variants, c.dl, c.regen),
+    c.variants,
+    h('div', { class: 'pk-actions' }, c.dl, c.regen),
     c.form,
     c.rationale,
   );
@@ -718,10 +719,10 @@ function updateCard(c, it) {
   const stateText =
     st === 'rendering'
       ? dimmed
-        ? 're-rendering…'
-        : `rendering ${Math.min(done, VARIANTS_PER_FORMAT)}/${VARIANTS_PER_FORMAT}`
+        ? (isPro() ? 're-rendering…' : 'making a new version…')
+        : (isPro() ? `rendering ${Math.min(done, VARIANTS_PER_FORMAT)}/${VARIANTS_PER_FORMAT}` : 'designing…')
       : st === 'judging'
-        ? 'judging…'
+        ? (isPro() ? 'judging…' : 'picking the best…')
         : st === 'error'
           ? `⚠ ${it.error || 'failed'}`
           : st === 'idle'
@@ -752,7 +753,7 @@ function updateCard(c, it) {
             onclick: () => selectVariant(it.format, x.idx),
           },
           h('img', { src: versioned(x.url, x.v), alt: `Variant ${x.idx}`, loading: 'lazy', decoding: 'async', draggable: 'false' }),
-          h('span', { class: 'pk-vidx mono' }, `V${x.idx}`),
+          h('span', { class: 'pk-vidx mono pro-only' }, `V${x.idx}`),
         ),
       ),
     );
