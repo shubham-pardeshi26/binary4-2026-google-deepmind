@@ -1,4 +1,4 @@
-# AdLoop: Brief to Storyboard to Film to Score, in One Loop
+# AdMate Studio: Brief to Storyboard to Film to Score, in One Loop
 
 *A pipelined GenMedia ad studio where Nano Banana 2 Lite, Gemini Omni Flash and Lyria 3.5 work as one chained system, and you direct the result in plain English.*
 
@@ -6,13 +6,13 @@
 
 ## The problem with "prompt box" creative tools
 
-Most generative creative tools are one prompt box per modality. You prompt an image, paste it into a video tool, then find music separately. Each step forgets the last: the hero changes face between shots, the music ignores the pacing, every revision starts from zero.
+Most generative creative tools are one prompt box per modality. Each step forgets the last: the hero changes face between shots, the music ignores the pacing, every revision starts from zero.
 
-An ad exposes this. It needs a consistent product and cast across scenes, motion that respects the keyframe, a score that follows the story's energy, a voice that sells, and fast iteration when a client says "make it feel like a monsoon evening." AdLoop makes that one loop: each model's output is the next model's input, and a change in one modality flows through the others.
+An ad exposes this. It needs a consistent product and cast across scenes, motion that respects the keyframe, a score that follows the story's energy, a voice that sells, and fast iteration when a client says "make it feel like a monsoon evening." AdMate Studio makes that one loop: each model's output is the next model's input, and a change in one modality flows through the others.
 
-## What AdLoop does
+## What AdMate Studio does
 
-You give AdLoop a brief, typed or spoken, plus an optional brand name and product photo. Then:
+You give AdMate a brief, typed or spoken, plus an optional brand name and product photo. Then:
 
 1. **Gemini 3.8 Flash** acts as creative director and returns a structured plan: campaign name, tagline, palette, style, scenes with beats, durations, moods, energy and a voiceover line each, plus a music brief and a narrator voice.
 2. **Nano Banana 2 Lite** renders a continuity anchor, then fans out K variants for every scene in parallel.
@@ -20,8 +20,9 @@ You give AdLoop a brief, typed or spoken, plus an optional brand name and produc
 4. **Gemini Omni Flash** animates each winning keyframe into a clip.
 5. **Lyria 3.5** scores the ad from a timed prompt built from the scene plan, while **Flash TTS** voices every scene's line.
 6. ffmpeg stitches the final cut with narration on each scene's timecode, music ducked underneath and WebVTT captions. It auto-updates whenever anything changes.
+7. **Nano Banana 2 Lite** turns the winners into a **Campaign Kit**: judged, typography-rendered posters for Instagram, Stories, print, web and billboards, plus a one-click ZIP of every asset.
 
-Then the loop keeps going. You can chat with any clip ("slower push-in", "add gentle rain"), or type one sentence to direct the whole ad. You can override a judge's pick, re-voice a line, or localize for Hyderabad, Chennai or Tokyo. Presentation mode is a slide-by-slide narrated pitch: one slide per scene with its clip and voiceover, then the film and a "how it was made" slide from live telemetry.
+Then the loop keeps going. You can chat with any clip ("slower push-in", "add gentle rain"), or type one sentence to direct the whole ad. You can override a judge's pick, re-voice a line, or localize for Hyderabad, Chennai or Tokyo. The default view is deliberately simple; a "Behind the scenes" toggle reveals models, scores and telemetry. Presentation mode is a slide-by-slide narrated pitch: one slide per scene with its clip and voiceover, then the film and a "how it was made" slide from live telemetry.
 
 ## Architecture
 
@@ -33,9 +34,11 @@ Then the loop keeps going. You can chat with any clip ("slower push-in", "add ge
 
 **Judge tournament with self-repair.** Draft-then-verify for images: generate K, have a vision model pick one and explain why, and if nothing clears the bar, feed its critique back as an edit instruction. A user override triggers a re-render.
 
-**Conversational editing on Omni.** Each clip keeps its Interactions API `interaction_id`. A per-clip instruction becomes a new turn with `previous_interaction_id`, so "now add rain" builds on "golden hour" instead of starting over. In parallel, Flash reads the instruction for mood changes. **Direct the whole ad** asks Flash for a DirectionPlan: per-scene Omni instructions, mood updates, an optional keyframe restyle and a music instruction. AdLoop then fans all of them out at once.
+**Conversational editing on Omni.** Each clip keeps its Interactions API `interaction_id`. A per-clip instruction becomes a new turn with `previous_interaction_id`, so "now add rain" builds on "golden hour" instead of starting over. In parallel, Flash reads the instruction for mood changes. **Direct the whole ad** asks Flash for a DirectionPlan: per-scene Omni instructions, mood updates, an optional keyframe restyle and a music instruction. AdMate then fans all of them out at once.
 
 **Adaptive re-scoring and re-voicing.** When an edit changes a scene's mood, Lyria re-scores with a reason ("scene s2 → moody"). A tone change ("make it playful") re-voices the affected lines in parallel with the Omni edits. Sound follows picture.
+
+**Campaign Kit, off the critical path.** When the last scene winner lands, a plugin (subscribed to the event stream, with no pipeline changes) has Flash write poster copy, then NB2 renders 5 formats × 2 layouts in parallel, anchored to the hero keyframe. A judge that caps any poster with garbled text picks each format's winner, all while Omni is still rendering. Localization NB2-edits only the poster text into each market's script.
 
 **Localization fan-out.** For each market in parallel, Flash writes a localization plan (translated text and narration in native script, cultural adaptation of setting and props). NB2 edits every winning keyframe, Lyria produces a regional variant and TTS speaks the localized lines; together they become a narrated, captioned animatic per market.
 
@@ -74,6 +77,7 @@ Measured with `scripts/bench_nb2.py` and the live telemetry of a 4-scene × 4-va
 | Time to final cut | [[time-to-final]] |
 | Generations per ad (storyboard + repairs) | [[images per run]] |
 | Flash TTS voiceover p50 per scene | [[TTS p50]] |
+| Campaign Kit (10 posters) wall time | [[kit time]] |
 
 [[One sentence on what the numbers mean, e.g. first clip before the last storyboard is judged.]]
 
@@ -82,5 +86,4 @@ Measured with `scripts/bench_nb2.py` and the live telemetry of a 4-scene × 4-va
 - Brand-kit memory across campaigns, so the anchor and brand bible persist.
 - Pairwise or ensemble judging, and learning the rubric from user overrides.
 - Full Omni video per market, not just narrated animatics.
-- Lip-synced talent, and export of A/B variants to ad platforms.
-- An object store and shared event log for multi-instance deployment. Event sourcing makes this a storage swap, not a rewrite.
+- Multi-instance deployment: with event sourcing this is a storage swap, not a rewrite.

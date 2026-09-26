@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AdLoop end-to-end integration test (mock mode).
+"""AdMate end-to-end integration test (mock mode).
 
 Drives the real HTTP API exactly like the studio UI does -- multipart run creation, SSE consumption, every user
 action -- and asserts the CONTRACT (§6 run state + events, §7 endpoints) holds end to end:
@@ -26,8 +26,8 @@ action -- and asserts the CONTRACT (§6 run state + events, §7 endpoints) holds
 Two ways to reach the server:
 
 ``--base http://localhost:8102``
-    A running server started with ``ADLOOP_MOCK=1``. For the rate-limit step start it with a small
-    ``ADLOOP_RUNS_PER_IP_PER_HOUR`` (e.g. 6); restart persistence is then checked with a second invocation
+    A running server started with ``ADMATE_MOCK=1``. For the rate-limit step start it with a small
+    ``ADMATE_RUNS_PER_IP_PER_HOUR`` (e.g. 6); restart persistence is then checked with a second invocation
     ``--phase restart --run-id <id>`` after restarting the server (the first phase prints the exact command).
 
 ``--inprocess``
@@ -37,7 +37,7 @@ Two ways to reach the server:
 
 Exit status is 0 only if every check passed. Usage::
 
-    ADLOOP_MOCK=1 .venv/bin/uvicorn app.main:app --port 8102 &
+    ADMATE_MOCK=1 .venv/bin/uvicorn app.main:app --port 8102 &
     .venv/bin/python scripts/e2e_mock.py --base http://localhost:8102
     .venv/bin/python scripts/e2e_mock.py --inprocess            # self-contained
 """
@@ -136,7 +136,7 @@ class Report:
     def print_summary(self) -> None:
         width = max(len(s.name) for s in self.steps) if self.steps else 10
         print("\n" + "=" * (width + 40))
-        print("AdLoop e2e summary")
+        print("AdMate e2e summary")
         print("=" * (width + 40))
         for s in self.steps:
             print(f"  {'PASS' if s.ok else 'FAIL'}  {s.name:<{width}}  {s.seconds:7.2f}s  {s.detail}")
@@ -474,7 +474,7 @@ class E2E:
     async def health(self) -> str:
         h = await get_json(self.c, "/api/health")
         check(h.get("ok") is True, f"health not ok: {h}")
-        check(h.get("mode") == "mock", f"server must run in mock mode (ADLOOP_MOCK=1), got {h.get('mode')}")
+        check(h.get("mode") == "mock", f"server must run in mock mode (ADMATE_MOCK=1), got {h.get('mode')}")
         check(h.get("ffmpeg") is True, "ffmpeg not available on the server")
         check(isinstance(h.get("models"), dict) and isinstance(h.get("genai"), dict), "health.models/genai missing")
         r = await self.c.get("/")
@@ -1101,8 +1101,8 @@ class E2E:
         h = await get_json(self.c, "/api/health")
         limits = h.get("limits") or {}
         per_ip = int(limits.get("runs_per_ip_per_hour") or 0)
-        check(per_ip > 0, "server has no per-IP limit; start it with ADLOOP_RUNS_PER_IP_PER_HOUR=<n> (e.g. 6)")
-        check(per_ip <= 12, f"per-IP limit {per_ip} too high to exercise; use ADLOOP_RUNS_PER_IP_PER_HOUR<=12")
+        check(per_ip > 0, "server has no per-IP limit; start it with ADMATE_RUNS_PER_IP_PER_HOUR=<n> (e.g. 6)")
+        check(per_ip <= 12, f"per-IP limit {per_ip} too high to exercise; use ADMATE_RUNS_PER_IP_PER_HOUR<=12")
         created = 0
         for _ in range(per_ip + 1):
             r = await create_run(self.c, brief="rate limit probe", brand="", aspect="16:9", n_scenes=3, variants=2,
@@ -1217,7 +1217,7 @@ def _restart_in_fresh_process(args: argparse.Namespace, run_id: str) -> bool:
     cmd = [sys.executable, str(Path(__file__).resolve()), "--inprocess", "--phase", "restart", "--run-id", run_id,
            "--data-dir", args.data_dir, "--timeout", str(args.timeout)]
     print(f"\n--- restart persistence: fresh process\n$ {' '.join(cmd)}", flush=True)
-    proc = subprocess.run(cmd, cwd=str(ROOT), env={**os.environ, "ADLOOP_MOCK": "1"})
+    proc = subprocess.run(cmd, cwd=str(ROOT), env={**os.environ, "ADMATE_MOCK": "1"})
     return proc.returncode == 0
 
 
@@ -1228,16 +1228,16 @@ async def amain(args: argparse.Namespace) -> int:
     run_id: str | None = None
     if args.inprocess:
         # Configure the app *before* importing it: settings are read once at import time.
-        os.environ["ADLOOP_MOCK"] = "1"
-        os.environ["ADLOOP_DATA_DIR"] = args.data_dir
-        os.environ.setdefault("ADLOOP_MOCK_SPEED", str(args.mock_speed))
-        os.environ.setdefault("ADLOOP_RUNS_PER_IP_PER_HOUR", "6")
-        os.environ.setdefault("ADLOOP_MAX_CONCURRENT_RUNS", "8")
+        os.environ["ADMATE_MOCK"] = "1"
+        os.environ["ADMATE_DATA_DIR"] = args.data_dir
+        os.environ.setdefault("ADMATE_MOCK_SPEED", str(args.mock_speed))
+        os.environ.setdefault("ADMATE_RUNS_PER_IP_PER_HOUR", "6")
+        os.environ.setdefault("ADMATE_MAX_CONCURRENT_RUNS", "8")
         sys.path.insert(0, str(ROOT))
         from app.main import app  # noqa: WPS433
 
         async with app.router.lifespan_context(app):
-            async with httpx.AsyncClient(transport=StreamingASGITransport(app), base_url="http://adloop.test",
+            async with httpx.AsyncClient(transport=StreamingASGITransport(app), base_url="http://admate.test",
                                          timeout=limits) as client:
                 if args.phase == "restart":
                     await restart_checks(client, report, args.run_id, args.timeout)
@@ -1274,7 +1274,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--run-id", help="run to verify in --phase restart")
     ap.add_argument("--timeout", type=float, default=120.0, help="per-wait timeout in seconds (default 120)")
     ap.add_argument("--data-dir", default=None, help="--inprocess data dir (default: fresh temp dir)")
-    ap.add_argument("--mock-speed", type=float, default=0.5, help="--inprocess ADLOOP_MOCK_SPEED (default 0.5)")
+    ap.add_argument("--mock-speed", type=float, default=0.5, help="--inprocess ADMATE_MOCK_SPEED (default 0.5)")
     ap.add_argument("--skip-rate-limit", action="store_true", help="skip the 429 step")
     args = ap.parse_args(argv)
     if args.phase == "restart" and not args.run_id:
@@ -1282,7 +1282,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.inprocess and not args.data_dir:
         if args.phase == "restart":
             ap.error("--phase restart --inprocess requires --data-dir")
-        args.data_dir = tempfile.mkdtemp(prefix="adloop_e2e_")
+        args.data_dir = tempfile.mkdtemp(prefix="admate_e2e_")
     if args.base:
         args.base = args.base.rstrip("/")
     return args

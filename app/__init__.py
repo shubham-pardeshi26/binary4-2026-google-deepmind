@@ -1,4 +1,4 @@
-"""AdLoop — a one-loop GenMedia ad studio.
+"""AdMate Studio — a one-loop GenMedia ad studio.
 
 Brief -> creative director plan -> Nano Banana storyboard fan-out -> vision-judge
 tournament with self-repair -> Omni image-to-video + conversational editing ->

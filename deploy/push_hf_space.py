@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create/update the AdLoop Hugging Face Space (Docker SDK) in one command.
+"""Create/update the AdMate Hugging Face Space (Docker SDK) in one command.
 
 Uploads the repo (minus secrets, venv and runtime data), swaps in
 deploy/hf_space_README.md as the Space README (it carries the Docker
@@ -8,10 +8,10 @@ local environment -- the key never touches the uploaded files.
 
     pip install huggingface_hub            # one-off, not an app dependency
     huggingface-cli login                  # or export HF_TOKEN=...
-    GEMINI_API_KEY=... python deploy/push_hf_space.py <user-or-org>/adloop
+    GEMINI_API_KEY=... python deploy/push_hf_space.py <user-or-org>/admate
 
-Optional env passed through as Space variables: ADLOOP_MAX_CONCURRENT_RUNS,
-ADLOOP_RUNS_PER_IP_PER_HOUR, ADLOOP_SHOWCASE_RUN, ADLOOP_MOCK.
+Optional env passed through as Space variables: ADMATE_MAX_CONCURRENT_RUNS,
+ADMATE_RUNS_PER_IP_PER_HOUR, ADMATE_SHOWCASE_RUN, ADMATE_MOCK.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 IGNORE = [".env", ".env.*", ".venv/**", "venv/**", "data/**", "**/__pycache__/**", "*.pyc",
           ".git/**", ".DS_Store", "README.md"]
-PASSTHROUGH_VARS = ("ADLOOP_MAX_CONCURRENT_RUNS", "ADLOOP_RUNS_PER_IP_PER_HOUR", "ADLOOP_SHOWCASE_RUN", "ADLOOP_MOCK")
+PASSTHROUGH_VARS = ("ADMATE_MAX_CONCURRENT_RUNS", "ADMATE_RUNS_PER_IP_PER_HOUR", "ADMATE_SHOWCASE_RUN", "ADMATE_MOCK")
 
 
 def main() -> int:
@@ -50,7 +50,7 @@ def main() -> int:
             api.add_space_variable(repo_id, name, os.environ[name])
 
     api.upload_folder(folder_path=str(ROOT), repo_id=repo_id, repo_type="space",
-                      ignore_patterns=IGNORE, commit_message="Deploy AdLoop")
+                      ignore_patterns=IGNORE, commit_message="Deploy AdMate")
     api.upload_file(path_or_fileobj=str(ROOT / "deploy" / "hf_space_README.md"), path_in_repo="README.md",
                     repo_id=repo_id, repo_type="space", commit_message="Space README (Docker frontmatter)")
     print(f"Pushed. Build logs: https://huggingface.co/spaces/{repo_id}?logs=build")

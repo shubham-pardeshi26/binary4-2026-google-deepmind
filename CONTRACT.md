@@ -1,6 +1,6 @@
-# AdLoop — Build Contract (single source of truth for all builders)
+# AdMate — Build Contract (single source of truth for all builders)
 
-**Product:** AdLoop — a one-loop GenMedia ad studio (Kaggle GDM Hyderabad Hackathon, Problem Statement 3).
+**Product:** AdMate — a one-loop GenMedia ad studio (Kaggle GDM Hyderabad Hackathon, Problem Statement 3).
 Brief (voice or text) → Gemini 3.8 Flash creative director → **Nano Banana 2 Lite** storyboard fan-out
 (N scenes × K variants, parallel, continuity-anchored) → Flash **vision judge tournament** with self-repair
 → **Gemini Omni Flash** image-to-video per winning keyframe (pipelined, starts the instant a scene's winner is
@@ -13,7 +13,7 @@ shows throughput / p50 / p95 / in-flight counts, and the pipeline is **pipelined
 
 Project root: `/Users/anishvijayvergiya/Desktop/adloop` · Python 3.11 venv at `.venv` (all deps installed:
 fastapi, uvicorn[standard], google-genai==2.25.0, pillow, imageio-ffmpeg, python-multipart, python-dotenv, httpx).
-Run: `.venv/bin/uvicorn app.main:app --port 8000 --reload`. **Mock mode** (`ADLOOP_MOCK=1` or no API key)
+Run: `.venv/bin/uvicorn app.main:app --port 8000 --reload`. **Mock mode** (`ADMATE_MOCK=1` or no API key)
 must make the entire app work offline with synthetic assets — builders test in mock mode.
 NOTE: outbound network to Google is currently blocked on the dev laptop, so ALL local testing is mock mode.
 
@@ -32,11 +32,11 @@ Never write the API key into any file except the existing gitignored `.env`. The
 
 | Role | Env var | Default id |
 |---|---|---|
-| Creative director / judge / edit interpreter | `ADLOOP_MODEL_TEXT` | `gemini-3.8-flash` |
-| Storyboard + localization images (**focus**) | `ADLOOP_MODEL_IMAGE` | `gemini-3.1-flash-lite-image` |
-| Image-to-video + conversational edit (**focus**) | `ADLOOP_MODEL_VIDEO` | `gemini-omni-1.1-flash` |
-| Soundtrack (**focus**) | `ADLOOP_MODEL_MUSIC` | `lyria-3.5` |
-| Voice brief transcription | `ADLOOP_MODEL_TRANSCRIBE` | `gemini-3.5-transcribe` |
+| Creative director / judge / edit interpreter | `ADMATE_MODEL_TEXT` | `gemini-3.8-flash` |
+| Storyboard + localization images (**focus**) | `ADMATE_MODEL_IMAGE` | `gemini-3.1-flash-lite-image` |
+| Image-to-video + conversational edit (**focus**) | `ADMATE_MODEL_VIDEO` | `gemini-omni-1.1-flash` |
+| Soundtrack (**focus**) | `ADMATE_MODEL_MUSIC` | `lyria-3.5` |
+| Voice brief transcription | `ADMATE_MODEL_TRANSCRIBE` | `gemini-3.5-transcribe` |
 
 API key: `GEMINI_API_KEY` (fallback `GOOGLE_API_KEY`), loaded from `.env` via python-dotenv.
 
@@ -78,19 +78,19 @@ UI must be short, human-readable, and include the model id + api path.
 ```python
 class Settings:  # plain class or dataclass, instantiated once as `settings`
     api_key: str | None
-    mock: bool                      # ADLOOP_MOCK=1 or no api key
+    mock: bool                      # ADMATE_MOCK=1 or no api key
     model_text, model_image, model_video, model_music, model_transcribe: str
-    image_concurrency: int = 8      # ADLOOP_IMAGE_CONCURRENCY
-    video_concurrency: int = 4      # ADLOOP_VIDEO_CONCURRENCY
-    text_concurrency: int = 6       # ADLOOP_TEXT_CONCURRENCY
-    video_resolution: str = "720p"  # ADLOOP_VIDEO_RESOLUTION
-    video_seconds: int = 6          # ADLOOP_VIDEO_SECONDS (default clip duration)
+    image_concurrency: int = 8      # ADMATE_IMAGE_CONCURRENCY
+    video_concurrency: int = 4      # ADMATE_VIDEO_CONCURRENCY
+    text_concurrency: int = 6       # ADMATE_TEXT_CONCURRENCY
+    video_resolution: str = "720p"  # ADMATE_VIDEO_RESOLUTION
+    video_seconds: int = 6          # ADMATE_VIDEO_SECONDS (default clip duration)
     video_poll_seconds: float = 3.0
     video_timeout_seconds: int = 420
     judge_threshold: float = 7.0    # repair round triggered if best overall < threshold
     max_repair_rounds: int = 1
-    max_concurrent_runs: int = 3    # ADLOOP_MAX_CONCURRENT_RUNS
-    runs_per_ip_per_hour: int = 6   # ADLOOP_RUNS_PER_IP_PER_HOUR (0 = unlimited)
+    max_concurrent_runs: int = 3    # ADMATE_MAX_CONCURRENT_RUNS
+    runs_per_ip_per_hour: int = 6   # ADMATE_RUNS_PER_IP_PER_HOUR (0 = unlimited)
     data_dir: Path = ROOT / "data" / "runs"
     static_dir: Path = ROOT / "static"
 settings = Settings()
@@ -197,7 +197,7 @@ async def probe_duration(path: Path) -> float
 async def stitch(clips: list[Path], music: Path | None, out: Path, *, aspect: str, fade_s: float = 0.35) -> float
     # normalize each clip to 1280x720 (or 720x1280) 30fps h264 (scale+pad), short crossfade or hard cut,
     # music trimmed/padded to total video length with 1.2s fade-out, music loudness normalized; drop clip audio unless
-    # ADLOOP_KEEP_CLIP_AUDIO=1 (then mix at 0.35). +faststart. Returns duration seconds.
+    # ADMATE_KEEP_CLIP_AUDIO=1 (then mix at 0.35). +faststart. Returns duration seconds.
 def save_bytes(run_dir: Path, name: str, data: bytes) -> Path
 def ext_for_mime(mime: str) -> str
 ```
@@ -305,7 +305,7 @@ Metrics object: `{"wall_ms", "images_generated", "image_p50_ms", "image_p95_ms",
 | POST | `/api/runs/{id}/music` | `{"instruction": str?}` | `{"ok": true}` |
 | POST | `/api/runs/{id}/localize` | `{"markets": [str]}` | `{"ok": true}` |
 | POST | `/api/runs/{id}/final` | – | `{"ok": true}` (force re-stitch) |
-| GET | `/api/showcase` | – | `{"run_id": str|null}` — env `ADLOOP_SHOWCASE_RUN` or the newest run with a final cut |
+| GET | `/api/showcase` | – | `{"run_id": str|null}` — env `ADMATE_SHOWCASE_RUN` or the newest run with a final cut |
 
 Errors: JSON `{"error": "msg"}` with proper status. On startup, load existing `run.json` files so finished runs
 are browsable/replayable after restart. Background tasks must never crash the server; every exception becomes
@@ -314,7 +314,7 @@ an `error` + `log` event and a sensible `status`.
 ## 8. Frontend (C: vanilla JS, no build step)
 Single page "studio", dark cinematic UI, zero framework (plain ES module `app.js`), fonts via Google Fonts link
 (degrade gracefully offline). Must feel like a pro creative tool, not a form. Sections:
-1. **Top bar**: AdLoop logo/wordmark, tagline "Brief → storyboard → film → score, in one loop", three model chips
+1. **Top bar**: AdMate logo/wordmark, tagline "Brief → storyboard → film → score, in one loop", three model chips
    (Nano Banana 2 Lite · Omni Flash · Lyria 3.5) that pulse while that modality has in-flight work, LIVE/MOCK badge
    (from `/api/health`), "Watch sample run" (uses `/api/showcase` + `replay=1`).
 2. **Brief panel**: large textarea, 🎙 mic button (MediaRecorder → `/api/transcribe` → fills textarea; shows
@@ -355,8 +355,8 @@ scene_id+idx / v). Toasts for errors. Responsive down to 1280px wide; 9:16 aspec
 ### 9a. Model role `tts`
 | Role | Env var | Default id |
 |---|---|---|
-| Scene-by-scene voiceover narration | `ADLOOP_MODEL_TTS` | `gemini-3.8-flash-tts` |
-Settings gain `model_tts`, `tts_concurrency: int = 6` (`ADLOOP_TTS_CONCURRENCY`), and `models` dicts include `"tts"`.
+| Scene-by-scene voiceover narration | `ADMATE_MODEL_TTS` | `gemini-3.8-flash-tts` |
+Settings gain `model_tts`, `tts_concurrency: int = 6` (`ADMATE_TTS_CONCURRENCY`), and `models` dicts include `"tts"`.
 
 `GenMedia.generate_speech(text: str, *, voice: str = "Kore", style: str | None = None, language: str | None = None) -> GenResult`
 - returns **WAV bytes** (`audio/wav`). Gemini TTS returns raw PCM (`audio/L16;codec=pcm;rate=24000`, mono 16-bit) — wrap it in a WAV
@@ -364,7 +364,7 @@ Settings gain `model_tts`, `tts_concurrency: int = 6` (`ADLOOP_TTS_CONCURRENCY`)
 - Primary: `generate_content(model_tts, contents="<style directive>: <text>", config=GenerateContentConfig(response_modalities=["AUDIO"],
   speech_config=SpeechConfig(voice_config=VoiceConfig(prebuilt_voice_config=PrebuiltVoiceConfig(voice_name=voice)))))` (+ language_code if the
   SDK SpeechConfig supports it). Fallback: interactions (`response_modalities=["audio"]`, `generation_config={"speech_config": ...}`) — verify
-  field names in the SDK. Same retry/fallback/path-memory rules as other adapters; env override `ADLOOP_TTS_PATH`.
+  field names in the SDK. Same retry/fallback/path-memory rules as other adapters; env override `ADMATE_TTS_PATH`.
 - Mock: speech-like WAV (syllable-rate amplitude envelope over a voiced formant-ish tone), length ≈ words / 2.6 s, 0.4–1.0 s latency.
 
 ### 9b. Plan additions (prompts.py / mock.py; normalize_plan must fill defaults)

@@ -1,5 +1,5 @@
 /*
- * AdLoop studio styles.
+ * AdMate studio styles.
  * Dark cinematic theme: near-black canvas, layered glass panels, one signature
  * gradient (violet → magenta → amber). Space Grotesk headings, Inter UI,
  * JetBrains Mono telemetry — all with system fallbacks for offline demos.
@@ -827,3 +827,58 @@ body.big-screen .counter b { font-size: 34px; }
   .dropzone { min-height: 52px; }
   .hero { padding-top: 40px; }
 }
+
+/* ═══════════ Simple (default) vs Pro ("Behind the scenes") view ═══════════ */
+body:not(.pro) .pro-only { display: none !important; }
+body.pro .simple-only { display: none !important; }
+.brand-studio { font-weight: 400; color: var(--text-2); margin-left: 5px; letter-spacing: -0.01em; }
+.pro-toggle[aria-pressed='true'] { border-color: rgba(124, 92, 255, 0.55); background: rgba(124, 92, 255, 0.1); }
+/* Simple view never shows the telemetry drawer or the sticky director bar. */
+body:not(.pro) .layout { grid-template-columns: var(--brief-w) minmax(0, 1fr); }
+body:not(.pro) .telemetry, body:not(.pro) .director-bar { display: none !important; }
+body:not(.pro) .bottom-spacer { height: 40px; }
+.more-opts { border: 1px solid var(--border-2); border-radius: 10px; padding: 8px 10px; }
+.more-opts > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--text-2); }
+.more-opts[open] > summary { margin-bottom: 10px; }
+.more-opts .field + .field { margin-top: 10px; }
+.try-label { font-size: 11.5px; font-weight: 600; color: var(--text-2); margin-bottom: -4px; }
+.hero-steps.simple-steps { grid-template-columns: repeat(4, 1fr); max-width: 760px; }
+/* Friendly progress card */
+.progress-card { padding: 18px 22px; display: flex; flex-direction: column; gap: 12px; }
+.pc-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.pc-title { font: 600 18px var(--f-head); margin: 0; }
+.pc-pct { font: 600 14px var(--f-mono); color: var(--text-2); }
+.pc-bar { height: 8px; border-radius: 99px; background: rgba(255, 255, 255, 0.07); overflow: hidden; }
+.pc-bar i { display: block; height: 100%; width: 0; border-radius: inherit; background: linear-gradient(90deg, #7c5cff, #ff4fd8, #ffb547); transition: width 0.5s var(--ease); }
+.pc-steps { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.pc-steps li { font-size: 12.5px; color: var(--muted); padding: 5px 11px; border-radius: 99px; border: 1px solid var(--border-2); }
+.pc-steps li.active { color: var(--text); border-color: rgba(255, 79, 216, 0.55); background: rgba(255, 79, 216, 0.08); }
+.pc-steps li.done { color: var(--text-2); }
+.pc-steps li.done::before { content: '✓ '; color: #4ade80; }
+/* Simple storyboard: one chosen picture per scene, alternatives on demand */
+body:not(.pro) .scene-row .tile-anchor, body:not(.pro) .scene-row .tile-marker,
+body:not(.pro) .scene-row .tile .badge, body:not(.pro) .scene-row .crown,
+body:not(.pro) .judge-note, body:not(.pro) .beat-chip, body:not(.pro) .energy,
+body:not(.pro) .badge.lat { display: none !important; }
+body:not(.pro) .scene-row.decided:not(.show-alts) .tile:not(.winner),
+body:not(.pro) .scene-row.decided:not(.show-alts) .lane:not(:has(.tile.winner)) { display: none; }
+body:not(.pro) .scene-row.decided:not(.show-alts) .lane { grid-template-columns: minmax(0, var(--tile-max)); }
+body:not(.pro) .scene-row.show-alts .tile.variant-pickable, body:not(.pro) .scene-row.show-alts .tile:not(.winner) { cursor: pointer; }
+.scene-narr { margin: 4px 0 0; font-size: 13px; color: var(--text-2); font-style: italic; }
+.alts-btn { margin-left: 6px; }
+.alts-hint { font-size: 12px; margin: 0 0 6px; }
+body:not(.pro) .scene-row:not(.show-alts) .alts-hint { display: none; }
+.vo-label, .ask-label { font-size: 12px; font-weight: 600; color: var(--text-2); }
+.ask-label { margin: 8px 0 -2px; display: block; }
+/* Chat with your studio */
+.chat-panel { display: flex; flex-direction: column; gap: 12px; }
+.chat-log { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; max-height: 340px; overflow-y: auto; }
+.chat-empty { font-size: 13px; }
+.bubble { max-width: 78%; padding: 9px 13px; border-radius: 14px; font-size: 13.5px; line-height: 1.4; animation: fadein 0.25s both; }
+.bubble.me { align-self: flex-end; background: linear-gradient(135deg, rgba(124, 92, 255, 0.35), rgba(255, 79, 216, 0.3)); border-bottom-right-radius: 4px; }
+.bubble.studio { align-self: flex-start; background: rgba(255, 255, 255, 0.06); border: 1px solid var(--border-2); border-bottom-left-radius: 4px; }
+.bubble.studio.busy { color: var(--muted); font-style: italic; }
+.bubble.studio.done { border-color: rgba(74, 222, 128, 0.45); }
+.bubble.studio.err { border-color: rgba(255, 99, 99, 0.5); }
+.chat-form { display: flex; gap: 8px; align-items: center; }
+.chat-form input { flex: 1; height: 40px; }

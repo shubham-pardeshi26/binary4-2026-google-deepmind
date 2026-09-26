@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AdLoop Campaign Kit (posters) end-to-end test -- mock mode, in-process ASGI (no TCP port, no network).
+"""AdMate Campaign Kit (posters) end-to-end test -- mock mode, in-process ASGI (no TCP port, no network).
 
 Drives the real ``app.main:app`` (with its lifespan) through a streaming in-process ASGI transport and asserts
 POSTERS_CONTRACT.md §2/§4 end to end:
@@ -20,7 +20,7 @@ this process only). Once the integration exists it detects it and skips self-wir
 
 Usage::
 
-    .venv/bin/python scripts/e2e_posters.py --inprocess --data-dir /tmp/adloop_posters --mock-speed 1.0
+    .venv/bin/python scripts/e2e_posters.py --inprocess --data-dir /tmp/admate_posters --mock-speed 1.0
 """
 
 from __future__ import annotations
@@ -477,17 +477,17 @@ def node_check() -> tuple[str, bool, str]:
 
 
 async def amain(args: argparse.Namespace) -> int:
-    os.environ["ADLOOP_MOCK"] = "1"
-    os.environ["ADLOOP_DATA_DIR"] = args.data_dir
-    os.environ["ADLOOP_MOCK_SPEED"] = str(args.mock_speed)
-    os.environ.setdefault("ADLOOP_RUNS_PER_IP_PER_HOUR", "0")
+    os.environ["ADMATE_MOCK"] = "1"
+    os.environ["ADMATE_DATA_DIR"] = args.data_dir
+    os.environ["ADMATE_MOCK_SPEED"] = str(args.mock_speed)
+    os.environ.setdefault("ADMATE_RUNS_PER_IP_PER_HOUR", "0")
     sys.path.insert(0, str(ROOT))
     from app.main import app  # noqa: WPS433 - settings are read at import time
 
     t0 = time.perf_counter()
-    print(f"AdLoop posters e2e · mock speed {args.mock_speed} · data {args.data_dir}", flush=True)
+    print(f"AdMate posters e2e · mock speed {args.mock_speed} · data {args.data_dir}", flush=True)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=StreamingASGITransport(app), base_url="http://adloop.test",
+        async with httpx.AsyncClient(transport=StreamingASGITransport(app), base_url="http://admate.test",
                                      timeout=httpx.Timeout(args.timeout, connect=10.0)) as client:
             print(f"  wiring: {await wire_plugin(app, client)}", flush=True)
             results = await main_test(client, args.timeout)
@@ -505,10 +505,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--inprocess", action="store_true", default=True,
                     help="serve app.main in-process (the only supported mode; flag kept for symmetry)")
     ap.add_argument("--data-dir", default=None, help="data dir (default: fresh temp dir)")
-    ap.add_argument("--mock-speed", type=float, default=1.0, help="ADLOOP_MOCK_SPEED (default 1.0)")
+    ap.add_argument("--mock-speed", type=float, default=1.0, help="ADMATE_MOCK_SPEED (default 1.0)")
     ap.add_argument("--timeout", type=float, default=90.0, help="per-wait timeout in seconds (default 90)")
     args = ap.parse_args(argv)
-    args.data_dir = args.data_dir or tempfile.mkdtemp(prefix="adloop_posters_e2e_")
+    args.data_dir = args.data_dir or tempfile.mkdtemp(prefix="admate_posters_e2e_")
     return args
 
 

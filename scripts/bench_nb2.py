@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Burst benchmark for Nano Banana 2 Lite (the AdLoop storyboard model).
+"""Burst benchmark for Nano Banana 2 Lite (the AdMate storyboard model).
 
 Fires N image generations through ``app.genai_client.GenMedia`` with at most C
-in flight -- the same shape as AdLoop's per-scene storyboard fan-out -- and
+in flight -- the same shape as AdMate's per-scene storyboard fan-out -- and
 reports the numbers we quote in the README / writeup:
 
     p50 / p95 / max latency, images per minute, time-to-first-image, errors
@@ -144,14 +144,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--aspect", default="16:9", choices=["16:9", "9:16"])
     p.add_argument("--size", default="1K", help="512 | 1K | 2K | 4K (default 1K)")
     p.add_argument("--ref", action="store_true", help="thread a continuity anchor through every call")
-    p.add_argument("--mock", action="store_true", help="force ADLOOP_MOCK=1 (offline harness check)")
+    p.add_argument("--mock", action="store_true", help="force ADMATE_MOCK=1 (offline harness check)")
     args = p.parse_args(argv)
     if args.n < 1 or args.concurrency < 1:
         p.error("-n and -c must be >= 1")
     if args.mock:
-        os.environ["ADLOOP_MOCK"] = "1"
+        os.environ["ADMATE_MOCK"] = "1"
     # GenMedia's internal image semaphore would otherwise cap the burst below -c.
-    os.environ["ADLOOP_IMAGE_CONCURRENCY"] = str(max(args.concurrency, int(os.getenv("ADLOOP_IMAGE_CONCURRENCY", "0") or 0)))
+    os.environ["ADMATE_IMAGE_CONCURRENCY"] = str(max(args.concurrency, int(os.getenv("ADMATE_IMAGE_CONCURRENCY", "0") or 0)))
 
     try:
         s = asyncio.run(bench(args))

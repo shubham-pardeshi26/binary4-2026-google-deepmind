@@ -1,5 +1,5 @@
 ---
-title: AdLoop
+title: AdMate Studio
 emoji: 🎬
 colorFrom: indigo
 colorTo: pink
@@ -10,9 +10,9 @@ license: apache-2.0
 short_description: Brief to storyboard to film to score, in one loop.
 ---
 
-# AdLoop — one-loop GenMedia ad studio
+# AdMate Studio — one-loop GenMedia ad studio
 
-AdLoop turns a one-line brief (typed or spoken) into a finished, scored video ad in a single pipelined loop:
+AdMate Studio turns a one-line brief (typed or spoken) into a finished, scored video ad in a single pipelined loop:
 Gemini Flash plans the campaign, **Nano Banana 2 Lite** fans out a continuity-anchored storyboard
 (N scenes x K variants, in parallel), a Flash vision judge runs a tournament with self-repair, **Gemini Omni Flash**
 animates each winning keyframe the instant it is picked and lets you direct every shot conversationally, and

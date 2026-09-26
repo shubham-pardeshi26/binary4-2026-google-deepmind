@@ -1,4 +1,4 @@
-"""GenMedia — the ONLY module in AdLoop that talks to Google's generative APIs.
+"""GenMedia — the ONLY module in AdMate that talks to Google's generative APIs.
 
 Every modality (text/JSON, image, video, video edit, music, speech, transcription) is
 exposed as one ``async`` method on :class:`GenMedia` returning a uniform
@@ -7,7 +7,7 @@ method is built as an ordered list of *API paths* (e.g. ``generate_content``
 then ``interactions``) with automatic fallback:
 
 * **Path memory** – the first path that succeeds for a model is remembered, so
-  later calls go straight there. ``ADLOOP_<ROLE>_PATH`` pins the first choice.
+  later calls go straight there. ``ADMATE_<ROLE>_PATH`` pins the first choice.
 * **Request-shape ladder** – on HTTP 400 INVALID_ARGUMENT (or an empty/unparseable
   response) the same path is retried with progressively *smaller* requests,
   dropping optional fields (``image_size``, ``resolution``, ``duration``,
@@ -24,7 +24,7 @@ then ``interactions``) with automatic fallback:
   short and of the form ``"<model> via <path>: <reason>"`` (API keys redacted).
 * **Telemetry** – per-model call/error counts, working path, p50/p95 latency and
   per-modality in-flight counters via :meth:`GenMedia.stats` / :attr:`GenMedia.inflight`.
-* **Mock mode** – with ``ADLOOP_MOCK=1`` (or no key) every method returns
+* **Mock mode** – with ``ADMATE_MOCK=1`` (or no key) every method returns
   deterministic synthetic assets after a realistic jittered delay (see
   :mod:`app.mock`), so the whole studio runs offline.
 
@@ -55,7 +55,7 @@ import httpx
 
 from app import mock as mockgen
 
-log = logging.getLogger("adloop.genai")
+log = logging.getLogger("admate.genai")
 
 ProgressCB = Callable[[dict], Awaitable[None]] | None
 
@@ -376,7 +376,7 @@ class _ModelStats:
 
 
 class GenMedia:
-    """Async facade over every Google GenMedia model AdLoop uses.
+    """Async facade over every Google GenMedia model AdMate uses.
 
     Parameters
     ----------

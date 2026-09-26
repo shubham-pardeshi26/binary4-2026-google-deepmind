@@ -1,10 +1,10 @@
-# Render Blueprint for AdLoop (Docker runtime).
+# Render Blueprint for AdMate (Docker runtime).
 # Render looks for render.yaml at the repo root by default: either copy this
 # file there, or set "Blueprint Path" to deploy/render.yaml when creating the
 # Blueprint in the dashboard. See deploy/DEPLOY.md section (c).
 services:
   - type: web
-    name: adloop
+    name: admate
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
@@ -15,16 +15,16 @@ services:
     envVars:
       - key: GEMINI_API_KEY
         sync: false           # prompted for in the dashboard; never committed
-      - key: ADLOOP_MOCK
+      - key: ADMATE_MOCK
         value: "0"
-      - key: ADLOOP_MAX_CONCURRENT_RUNS
+      - key: ADMATE_MAX_CONCURRENT_RUNS
         value: "2"
-      - key: ADLOOP_RUNS_PER_IP_PER_HOUR
+      - key: ADMATE_RUNS_PER_IP_PER_HOUR
         value: "4"
-      - key: ADLOOP_SHOWCASE_RUN
+      - key: ADMATE_SHOWCASE_RUN
         sync: false           # optional: run id to replay for "Watch sample run"
     # Optional: persist runs across deploys (paid plans only).
     # disk:
-    #   name: adloop-data
+    #   name: admate-data
     #   mountPath: /app/data
     #   sizeGB: 5

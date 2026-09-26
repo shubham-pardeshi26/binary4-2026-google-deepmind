@@ -1,6 +1,6 @@
-"""Deterministic synthetic payloads for AdLoop's offline mock mode.
+"""Deterministic synthetic payloads for AdMate's offline mock mode.
 
-Mock mode (``ADLOOP_MOCK=1`` or no API key) must exercise the *entire* studio —
+Mock mode (``ADMATE_MOCK=1`` or no API key) must exercise the *entire* studio —
 plan, storyboard fan-out, judge + repair rounds, video, edits, soundtrack and
 localization — without any network. This module provides:
 
@@ -253,7 +253,7 @@ def fake_plan(*, brief: str, brand: str = "", aspect: str = "16:9", n_scenes: in
 
 def _brand_from_brief(brief: str) -> str:
     words = [w for w in re.findall(r"[A-Za-z][A-Za-z']+", brief or "") if len(w) > 3]
-    return " ".join(w.capitalize() for w in words[:2]) or "AdLoop Brand"
+    return " ".join(w.capitalize() for w in words[:2]) or "AdMate Brand"
 
 
 def _energy_curve(beats: list[str]) -> list[float]:

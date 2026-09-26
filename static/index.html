@@ -1,6 +1,6 @@
 <!doctype html>
 <!--
-  AdLoop studio shell.
+  AdMate studio shell.
   Static markup only: every dynamic region is an empty, id'd container that
   static/app.js fills from the single run-state store (CONTRACT §8).
   No inline handlers; all behaviour is wired in app.js.
@@ -11,8 +11,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AdLoop · one-loop GenMedia ad studio</title>
-  <meta name="description" content="Brief → storyboard → film → score, in one loop. Gemini + Nano Banana 2 Lite + Omni Flash + Lyria." />
+  <title>AdMate Studio</title>
+  <meta name="description" content="AdMate Studio: turn one sentence into a finished video ad." />
   <meta name="color-scheme" content="dark" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='.55' stop-color='%23ff4fd8'/%3E%3Cstop offset='1' stop-color='%23ffb547'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='16' cy='16' r='11' fill='none' stroke='url(%23g)' stroke-width='5'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -29,11 +29,12 @@
   <header class="topbar glass">
     <a class="brand" href="#" id="brand-home" title="New loop">
       <span class="brand-mark" aria-hidden="true"></span>
-      <span class="brand-word">Ad<span class="grad-text">Loop</span></span>
+      <span class="brand-word">Ad<span class="grad-text">Mate</span><span class="brand-studio">Studio</span></span>
     </a>
-    <span class="tagline">Brief → storyboard → film → score, in one loop</span>
+    <span class="tagline pro-only">Brief → storyboard → film → score, in one loop</span>
+    <span class="tagline simple-only">Turn one sentence into a finished video ad</span>
 
-    <div class="model-chips" role="list" aria-label="Models in flight">
+    <div class="model-chips pro-only" role="list" aria-label="Models in flight">
       <span class="model-chip" id="chip-text" data-mod="text" role="listitem" title="Gemini Flash — director, judge, edit interpreter"><i></i>Gemini Flash</span>
       <span class="model-chip" id="chip-image" data-mod="image" role="listitem" title="Storyboard + localization keyframes"><i></i>Nano Banana 2 Lite</span>
       <span class="model-chip" id="chip-video" data-mod="video" role="listitem" title="Image-to-video + conversational editing"><i></i>Omni Flash</span>
@@ -42,13 +43,14 @@
     </div>
 
     <div class="topbar-right">
-      <span class="mode-badge" id="mode-badge" title="Backend mode">…</span>
+      <span class="mode-badge pro-only" id="mode-badge" title="Backend mode">…</span>
       <div class="recent">
         <button class="btn ghost sm" id="recent-btn" aria-haspopup="true" aria-expanded="false">Recent runs</button>
         <div class="recent-menu glass" id="recent-menu" hidden></div>
       </div>
-      <button class="btn grad sm" id="sample-btn">▶ <span class="lbl-long">Watch sample run</span><span class="lbl-short">Sample</span></button>
-      <button class="btn ghost sm tele-toggle" id="telemetry-toggle" title="Toggle telemetry (T)" aria-controls="telemetry" aria-expanded="false">
+      <button class="btn grad sm" id="sample-btn">▶ <span class="lbl-long">Watch an example</span><span class="lbl-short">Sample</span></button>
+      <button class="btn ghost sm pro-toggle" id="pro-toggle" type="button" aria-pressed="false" title="Show the technical details (models, timings, scores, telemetry)">⚙ <span class="lbl-long">Behind the scenes</span></button>
+      <button class="btn ghost sm tele-toggle pro-only" id="telemetry-toggle" title="Toggle telemetry (T)" aria-controls="telemetry" aria-expanded="false">
         <span class="tele-activity" id="tele-activity" aria-hidden="true"></span><span class="lbl-long">Telemetry</span><span class="lbl-short">Stats</span>
       </button>
     </div>
@@ -59,31 +61,32 @@
     <aside class="brief glass" id="brief-panel" aria-label="Creative brief">
       <div class="brief-scroll">
       <div class="panel-head">
-        <h2>Creative brief</h2>
-        <span class="muted small">voice or text</span>
+        <h2><span class="pro-only">Creative brief</span><span class="simple-only">What are you advertising?</span></h2>
+        <span class="muted small pro-only">voice or text</span>
       </div>
 
       <div class="brief-box">
         <textarea id="brief-text" rows="6" maxlength="2000"
-          placeholder="Describe the ad. Who is it for, what should they feel, what's the one thing to remember?"></textarea>
+          placeholder="Describe your product and who it's for. e.g. A cosy chai café for students on rainy evenings"></textarea>
         <div class="brief-tools">
           <button class="mic-btn" id="brief-mic" type="button" title="Dictate the brief">
-            <span class="mic-dot" aria-hidden="true"></span><span class="mic-label">🎙 Speak</span>
+            <span class="mic-dot" aria-hidden="true"></span><span class="mic-label">🎙 Speak instead</span>
           </button>
           <div class="rec-meter" id="brief-meter" hidden><span class="rec-time">0:00</span><span class="rec-bars"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span></div>
-          <span class="char-count muted mono" id="brief-count">0</span>
+          <span class="char-count muted mono pro-only" id="brief-count">0</span>
         </div>
       </div>
 
+      <div class="try-label">Try an example</div>
       <div class="sample-chips" id="sample-chips" aria-label="Sample briefs"></div>
 
       <label class="field">
-        <span class="field-label">Brand</span>
+        <span class="field-label">Brand name</span>
         <input id="brand-name" type="text" maxlength="80" placeholder="e.g. Chai Sutta Co." autocomplete="off" />
       </label>
 
       <div class="field">
-        <span class="field-label">Product photo <span class="muted">(optional · continuity reference)</span></span>
+        <span class="field-label">Product photo <span class="muted">(optional<span class="pro-only"> · continuity reference</span>)</span></span>
         <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Drop or choose a product photo">
           <input type="file" id="product-file" accept="image/png,image/jpeg,image/webp" hidden />
           <div class="dz-empty"><span class="dz-icon">⬆</span><span>Drop a product shot or <u>browse</u></span></div>
@@ -93,42 +96,54 @@
 
       <div class="field-row">
         <div class="field">
-          <span class="field-label">Aspect</span>
+          <span class="field-label">Format</span>
           <div class="segmented" id="aspect-toggle" role="radiogroup">
-            <button type="button" role="radio" data-aspect="16:9" aria-checked="true" class="on"><span class="ar-ico ar-land"></span>16:9</button>
-            <button type="button" role="radio" data-aspect="9:16" aria-checked="false"><span class="ar-ico ar-port"></span>9:16</button>
+            <button type="button" role="radio" data-aspect="16:9" aria-checked="true" class="on"><span class="ar-ico ar-land"></span><span class="pro-only">16:9</span><span class="simple-only">Landscape · YouTube</span></button>
+            <button type="button" role="radio" data-aspect="9:16" aria-checked="false"><span class="ar-ico ar-port"></span><span class="pro-only">9:16</span><span class="simple-only">Portrait · Reels</span></button>
           </div>
         </div>
       </div>
 
-      <div class="field-row">
+      <div class="field simple-only">
+        <span class="field-label">Length</span>
+        <div class="segmented" id="length-toggle" role="radiogroup">
+          <button type="button" role="radio" data-scenes="3" aria-checked="false">Short</button>
+          <button type="button" role="radio" data-scenes="4" aria-checked="true" class="on">Standard</button>
+          <button type="button" role="radio" data-scenes="6" aria-checked="false">Long</button>
+        </div>
+      </div>
+
+      <div class="field-row pro-only">
         <div class="field">
           <span class="field-label">Scenes</span>
           <div class="stepper" data-stepper="n_scenes" data-min="3" data-max="6" data-value="4">
             <button type="button" data-step="-1" aria-label="Fewer scenes">−</button><output>4</output><button type="button" data-step="1" aria-label="More scenes">+</button>
           </div>
         </div>
+      </div>
+
+      <details class="more-opts" id="more-opts">
+        <summary>More options</summary>
         <div class="field">
-          <span class="field-label">Variants / scene</span>
+          <span class="field-label"><span class="pro-only">Variants / scene</span><span class="simple-only">Picture options per scene</span></span>
           <div class="stepper" data-stepper="variants" data-min="2" data-max="6" data-value="4">
             <button type="button" data-step="-1" aria-label="Fewer variants">−</button><output>4</output><button type="button" data-step="1" aria-label="More variants">+</button>
           </div>
         </div>
-      </div>
-
-      <div class="field">
-        <span class="field-label">Markets <span class="muted">(localize after the cut)</span></span>
-        <div class="chip-set" id="brief-markets"></div>
-      </div>
+        <div class="field">
+          <span class="field-label">Markets <span class="muted">(<span class="pro-only">localize after the cut</span><span class="simple-only">also make versions for these countries</span>)</span></span>
+          <div class="chip-set" id="brief-markets"></div>
+        </div>
+      </details>
       </div>
 
       <!-- Sticky footer: the launch button is always visible, whatever the panel's scroll position. -->
       <div class="brief-foot">
-        <div class="fanout-hint mono" id="fanout-hint"></div>
+        <div class="fanout-hint mono pro-only" id="fanout-hint"></div>
         <button class="launch-btn" id="launch-btn" type="button">
           <span class="launch-glow" aria-hidden="true"></span>
           <span class="launch-spinner" aria-hidden="true"></span>
-          <span class="launch-label">Launch loop</span><span class="kbd">⌘↵</span>
+          <span class="launch-label">Create my ad</span><span class="kbd pro-only">⌘↵</span>
         </button>
       </div>
     </aside>
@@ -137,12 +152,19 @@
     <main class="workspace" id="workspace">
       <!-- Empty state (no run yet) -->
       <section class="hero" id="hero">
-        <div class="hero-eyebrow mono">GEMINI · NANO BANANA 2 LITE · OMNI FLASH · LYRIA 3.5</div>
+        <div class="hero-eyebrow mono pro-only">GEMINI · NANO BANANA 2 LITE · OMNI FLASH · LYRIA 3.5</div>
         <h1 class="hero-title">One sentence in.<br /><span class="grad-text">A finished ad out.</span></h1>
-        <p class="hero-sub">A creative director plans it, Nano Banana fans out the storyboard, a vision judge picks
+        <p class="hero-sub simple-only">Tell us what you're advertising. AdMate Studio plans the campaign, designs every scene, films it, adds music and a voiceover, and hands you a ready-to-post ad. Then just chat to change anything.</p>
+        <p class="hero-sub pro-only">A creative director plans it, Nano Banana fans out the storyboard, a vision judge picks
           winners and repairs the weak ones, Omni animates each keyframe the instant it wins, Lyria scores it and
           Flash TTS narrates it, all pipelined and all live.</p>
-        <div class="hero-steps">
+        <div class="hero-steps simple-steps simple-only">
+          <div class="hero-step"><b>01</b><span>Describe</span><small>one sentence or speak it</small></div>
+          <div class="hero-step"><b>02</b><span>We create</span><small>scenes, film, music, voice</small></div>
+          <div class="hero-step"><b>03</b><span>Chat to tweak</span><small>“make it warmer”</small></div>
+          <div class="hero-step"><b>04</b><span>Download</span><small>video + posters kit</small></div>
+        </div>
+        <div class="hero-steps pro-only">
           <div class="hero-step"><b>01</b><span>Director</span><small>Gemini Flash plan</small></div>
           <div class="hero-step"><b>02</b><span>Storyboard</span><small>N × K parallel keyframes</small></div>
           <div class="hero-step"><b>03</b><span>Judge</span><small>vision tournament + repair</small></div>
@@ -152,14 +174,20 @@
           <div class="hero-step"><b>07</b><span>Final cut</span><small>narrated & presentable</small></div>
         </div>
         <div class="hero-cta">
-          <button class="btn grad" id="hero-sample">▶ Watch sample run</button>
-          <span class="muted small">or write a brief on the left and hit <b>Launch loop</b></span>
+          <button class="btn grad" id="hero-sample">▶ Watch an example</button>
+          <span class="muted small">or describe your product on the left and hit <b>Create my ad</b></span>
         </div>
       </section>
 
       <div class="run-view" id="run-view" hidden>
         <!-- 3. Pipeline rail -->
-        <section class="rail glass" id="rail" aria-label="Pipeline">
+        <section class="progress-card glass simple-only" id="progress-card" aria-label="Progress">
+          <div class="pc-head"><h2 class="pc-title" id="pc-title">Planning your campaign…</h2><span class="pc-pct" id="pc-pct">0%</span></div>
+          <div class="pc-bar"><i id="pc-bar"></i></div>
+          <ol class="pc-steps" id="pc-steps"></ol>
+        </section>
+
+        <section class="rail glass pro-only" id="rail" aria-label="Pipeline">
           <div class="rail-clock">
             <span class="muted small">RUN</span>
             <span class="mono clock" id="run-clock">0.0 s</span>
@@ -169,7 +197,7 @@
         </section>
 
         <!-- Live waterfall: proves the pipeline is pipelined, not barriered -->
-        <section class="gantt glass" id="gantt" aria-label="Pipeline timeline">
+        <section class="gantt glass pro-only" id="gantt" aria-label="Pipeline timeline">
           <div class="gantt-head">
             <span class="tl-label mono muted">LIVE TIMELINE · every scene runs its own chain</span>
             <span class="gantt-legend mono" id="gantt-legend"></span>
@@ -178,7 +206,7 @@
         </section>
 
         <!-- One-shot celebration when the first final cut lands -->
-        <div class="cut-banner" id="cut-banner" hidden></div>
+        <div class="cut-banner pro-only" id="cut-banner" hidden></div>
 
         <!-- 4. Creative plan card -->
         <section class="plan glass" id="plan-card" aria-label="Creative plan"></section>
@@ -186,8 +214,8 @@
         <!-- 5. Storyboard fan-out -->
         <section class="panel" id="storyboard-panel" aria-label="Storyboard">
           <div class="section-head">
-            <h2><span class="step-no">02</span>Storyboard fan-out</h2>
-            <span class="section-meta mono" id="storyboard-meta"></span>
+            <h2><span class="step-no pro-only">02</span><span class="pro-only">Storyboard fan-out</span><span class="simple-only">Your storyboard</span></h2>
+            <span class="section-meta mono pro-only" id="storyboard-meta"></span>
           </div>
           <div class="storyboard" id="storyboard"></div>
         </section>
@@ -195,8 +223,8 @@
         <!-- 6. Motion lab -->
         <section class="panel" id="motion-panel" aria-label="Motion lab">
           <div class="section-head">
-            <h2><span class="step-no">04</span>Motion lab <span class="muted small">Omni Flash · conversational editing</span></h2>
-            <span class="section-meta mono" id="motion-meta"></span>
+            <h2><span class="step-no pro-only">04</span><span class="pro-only">Motion lab <span class="muted small">Omni Flash · conversational editing</span></span><span class="simple-only">Your scenes <span class="muted small">ask for a change on any scene</span></span></h2>
+            <span class="section-meta mono pro-only" id="motion-meta"></span>
           </div>
           <div class="motion-grid" id="motion-grid"></div>
         </section>
@@ -207,6 +235,19 @@
           <!-- 9. Final cut -->
           <section class="panel glass pad" id="final-panel" aria-label="Final cut"></section>
         </div>
+
+        <!-- Chat with your studio (simple view's replacement for the director bar) -->
+        <section class="panel glass pad chat-panel simple-only" id="chat-panel" aria-label="Chat with your studio" hidden>
+          <div class="section-head"><h2>💬 Chat with your studio <span class="muted small">change the whole ad in plain words</span></h2></div>
+          <ol class="chat-log" id="chat-log"></ol>
+          <p class="chat-empty muted" id="chat-empty">Tell the studio what to change, e.g. “make it a rainy evening and a bit slower” or “use a warmer, friendlier voice”.</p>
+          <form class="inline-form chat-form" id="chat-form" autocomplete="off">
+            <input id="chat-input" type="text" maxlength="400" placeholder="Type a change for the whole ad…" />
+            <button class="mic-btn sm" id="chat-mic" type="button" title="Speak your change"><span class="mic-dot" aria-hidden="true"></span><span class="mic-label">🎙</span></button>
+            <div class="rec-meter" id="chat-meter" hidden><span class="rec-time">0:00</span><span class="rec-bars"><i></i><i></i><i></i><i></i><i></i></span></div>
+            <button class="btn grad sm" type="submit" id="chat-send">Send</button>
+          </form>
+        </section>
 
         <!-- 10b. Campaign kit (posters plugin: static/posters.js fills it) -->
         <section class="panel glass pad" id="posters-mount" aria-label="Campaign kit"></section>
@@ -234,7 +275,7 @@
   </div>
 
   <!-- ─────────────────────────── 7. Director bar ─────────────────────────── -->
-  <div class="director-bar glass" id="director-bar" hidden>
+  <div class="director-bar glass pro-only" id="director-bar" hidden>
     <div class="dir-fanout" id="dir-fanout"></div>
     <form class="dir-form" id="dir-form" autocomplete="off">
       <span class="dir-badge grad-text">Direct</span>

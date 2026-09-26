@@ -1,4 +1,4 @@
-"""AdLoop HTTP server (FastAPI): studio page, media files, run API, SSE event streams.
+"""AdMate HTTP server (FastAPI): studio page, media files, run API, SSE event streams.
 
 Endpoints follow CONTRACT §7 (+ the §9c per-scene voiceover action). Design notes:
 
@@ -38,8 +38,9 @@ from app.config import settings
 from app.events import CLOSED, sse_format
 from app.genai_client import GenAIError, GenMedia
 from app.pipeline import MAX_INSTRUCTION_CHARS, MAX_VOICEOVER_CHARS, RunManager, valid_run_id
+from app.posters import PosterStudio, router as posters_router
 
-log = logging.getLogger("adloop.main")
+log = logging.getLogger("admate.main")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 #: SSE keep-alive interval (seconds).
@@ -73,15 +74,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     manager.load_existing()
     app.state.gm = gm
     app.state.manager = manager
-    log.info("AdLoop ready: %r", settings)
+    studio = PosterStudio(manager)
+    manager.observers.append(studio.on_event)
+    app.state.posters = studio
+    log.info("AdMate ready: %r", settings)
     try:
         yield
     finally:
         await manager.shutdown()
 
 
-app = FastAPI(title="AdLoop", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="AdMate Studio", description="AdMate Studio: brief to storyboard to film to score, in one loop.", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.include_router(posters_router)
 settings.static_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="static")
 
@@ -158,7 +163,7 @@ async def index():
     page = settings.static_dir / "index.html"
     if page.exists():
         return FileResponse(page, media_type="text/html", headers={"Cache-Control": "no-cache"})
-    return HTMLResponse("<!doctype html><title>AdLoop</title><h1>AdLoop</h1><p>The studio UI is not built yet. "
+    return HTMLResponse("<!doctype html><title>AdMate</title><h1>AdMate</h1><p>The studio UI is not built yet. "
                         "The API is live at <a href='/api/health'>/api/health</a>.</p>")
 
 

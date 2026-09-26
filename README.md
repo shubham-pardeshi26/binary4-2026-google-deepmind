@@ -1,8 +1,8 @@
-# AdLoop
+# AdMate Studio
 
 **Brief → storyboard → film → score, in one loop.**
 
-AdLoop is a GenMedia ad studio that turns a one-line brief (typed or spoken) into a finished, scored,
+AdMate Studio is a GenMedia ad studio that turns a one-line brief (typed or spoken) into a finished, scored,
 localized, **narrated** video ad — and then lets you *direct* it in plain English. Three focus models do the
 heavy lifting (**Nano Banana 2 Lite** storyboards, **Gemini Omni Flash** motion, **Lyria 3.5** score), with Gemini
 3.8 Flash directing and judging and Gemini Flash TTS voicing the ad scene by scene, all in one pipelined,
@@ -18,7 +18,7 @@ high-throughput loop where speed and cross-modal continuity carry the product, n
   storyboard, the judge picks keyframes, keyframes become Omni clips, scene moods become Lyria's timed score,
   each scene's voiceover line becomes narration placed on that scene's timecode, and edits flow back through all of them.
 - **Throughput matters.** A 4-scene ad with 4 variants per scene is 16+ Nano Banana 2 Lite generations,
-  4+ judge calls, 4 Omni renders and a score. AdLoop runs them as **independent per-scene chains with no global
+  4+ judge calls, 4 Omni renders and a score. AdMate Studio runs them as **independent per-scene chains with no global
   barrier**: scene 1 can be rendering video while scene 4 is still being judged.
 - **Speed buys quality.** NB2 Lite's latency lets us generate four candidates, keep one and discard three —
   a judge tournament with a self-repair round, which a slow image model can't afford to run.
@@ -83,12 +83,12 @@ reconnects and full **replays** of past runs all fall out of the same mechanism.
 
 | Role | Model (env var) | Why this model |
 |---|---|---|
-| Creative director, vision judge, edit interpreter *(supporting)* | `gemini-3.8-flash` (`ADLOOP_MODEL_TEXT`) | Fast structured JSON with vision; plans the campaign, scores variants against a 5-axis rubric, turns plain-English direction into per-modality edit plans. |
-| Storyboard, repairs, localization | **Nano Banana 2 Lite** `gemini-3.1-flash-lite-image` (`ADLOOP_MODEL_IMAGE`) | The throughput engine. Low latency makes K-variant tournaments and N-market localization fan-outs affordable; reference images keep hero and product consistent. |
-| Image-to-video, conversational video edits | **Gemini Omni Flash** `gemini-omni-1.1-flash` (`ADLOOP_MODEL_VIDEO`) | Animates the exact winning keyframe; multi-turn edits through the Interactions API (`previous_interaction_id`) keep context across "slower push-in" → "now add rain". |
-| Soundtrack | **Lyria 3.5** `lyria-3.5` (`ADLOOP_MODEL_MUSIC`) | Timed prompts built from scene durations and moods; re-scored automatically when edits change a scene's mood; ducked under the narration at stitch time. |
-| Scene-by-scene voiceover *(supporting)* | `gemini-3.8-flash-tts` (`ADLOOP_MODEL_TTS`) | Voices each scene's line (hook → benefit → CTA) in the plan's chosen voice and style; re-voices on tone changes; speaks localized lines in each market's language. |
-| Voice brief *(supporting)* | `gemini-3.5-transcribe` (`ADLOOP_MODEL_TRANSCRIBE`) | Speak the brief or the direction instead of typing it. |
+| Creative director, vision judge, edit interpreter *(supporting)* | `gemini-3.8-flash` (`ADMATE_MODEL_TEXT`) | Fast structured JSON with vision; plans the campaign, scores variants against a 5-axis rubric, turns plain-English direction into per-modality edit plans. |
+| Storyboard, repairs, localization | **Nano Banana 2 Lite** `gemini-3.1-flash-lite-image` (`ADMATE_MODEL_IMAGE`) | The throughput engine. Low latency makes K-variant tournaments and N-market localization fan-outs affordable; reference images keep hero and product consistent. |
+| Image-to-video, conversational video edits | **Gemini Omni Flash** `gemini-omni-1.1-flash` (`ADMATE_MODEL_VIDEO`) | Animates the exact winning keyframe; multi-turn edits through the Interactions API (`previous_interaction_id`) keep context across "slower push-in" → "now add rain". |
+| Soundtrack | **Lyria 3.5** `lyria-3.5` (`ADMATE_MODEL_MUSIC`) | Timed prompts built from scene durations and moods; re-scored automatically when edits change a scene's mood; ducked under the narration at stitch time. |
+| Scene-by-scene voiceover *(supporting)* | `gemini-3.8-flash-tts` (`ADMATE_MODEL_TTS`) | Voices each scene's line (hook → benefit → CTA) in the plan's chosen voice and style; re-voices on tone changes; speaks localized lines in each market's language. |
+| Voice brief *(supporting)* | `gemini-3.5-transcribe` (`ADMATE_MODEL_TRANSCRIBE`) | Speak the brief or the direction instead of typing it. |
 
 All model access goes through one adapter, `app/genai_client.py` (`GenMedia`). Each method tries the primary API
 path (Interactions API), falls back automatically (`generate_content`, `generate_videos`, minimal request on
@@ -96,6 +96,18 @@ HTTP 400), **remembers which path worked per model**, retries 429/5xx with expon
 concurrency per modality.
 
 ---
+
+## Simple view & Behind the scenes
+
+AdMate Studio opens in a **simple view** made for non-technical users: what you're advertising (typed or spoken),
+brand name, product photo, format and length, a friendly progress card, the storyboard (one picture per scene, with
+"See alternatives"), scene clips you can change by chatting, a **Chat with your studio** panel for whole-ad
+direction, the soundtrack, the final film (present / download / download everything) and the Campaign Kit posters.
+No model names, scores or timings.
+
+Click **⚙ Behind the scenes** in the top bar (or open the page with `?pro=1`) for the full technical view: model
+chips, LIVE/MOCK badge, pipeline rail and gantt, per-asset latency, judge scores/rationale/repair rounds, API paths,
+Lyria prompts and the telemetry drawer. The choice is remembered in `localStorage` (`admate.pro`).
 
 ## Features
 
@@ -113,6 +125,12 @@ concurrency per modality.
   word-budgeted to each scene's length, placed on its timecode (sped up ≤ 1.2× if it runs long), with the music
   sidechain-ducked underneath and WebVTT captions on the final player.
 - **Adaptive soundtrack** — Lyria score with a version list explaining each re-score ("scene s2 → moody").
+- **Campaign Kit (posters)** — the moment every scene has a winner, NB2 Lite renders **5 formats × 2 layouts** in parallel
+  (Instagram 1:1, Story 9:16, print 4:5, web banner 16:9, billboard 21:9) with Flash-written headline / subline / CTA rendered
+  as real typography in the brand palette, anchored to the hero keyframe. A Flash judge picks each format's winner (garbled
+  text can never win); swap winners, regenerate with an instruction, lightbox + download. Localization re-typesets every
+  poster into the market's script. **⬇ Download kit (.zip)** bundles the film, captions, score, voiceovers, keyframes,
+  posters, localized assets and the plan. It runs off the critical path, while Omni is still rendering.
 - **Final cut + presentation mode** — stitched MP4 with captions and download, and a fullscreen, **slide-by-slide
   narrated** pitch: title → one slide per scene (clip looping full-bleed, its voiceover playing, the line as a big
   caption) → the full film → "how it was made" stats → localized animatics. Auto-play advances when each line ends.
@@ -129,7 +147,7 @@ concurrency per modality.
 ## Quickstart
 
 ```bash
-git clone <this repo> adloop && cd adloop
+git clone <this repo> admate && cd admate
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env          # then set GEMINI_API_KEY=... in .env
@@ -137,19 +155,19 @@ cp .env.example .env          # then set GEMINI_API_KEY=... in .env
 # open http://localhost:8000
 ```
 
-**Mock mode** (no key, no network, synthetic assets): leave `GEMINI_API_KEY` empty or run with `ADLOOP_MOCK=1`:
+**Mock mode** (no key, no network, synthetic assets): leave `GEMINI_API_KEY` empty or run with `ADMATE_MOCK=1`:
 
 ```bash
-ADLOOP_MOCK=1 .venv/bin/uvicorn app.main:app --port 8000
+ADMATE_MOCK=1 .venv/bin/uvicorn app.main:app --port 8000
 ```
 
 **Local dev.** The top bar shows a **● LIVE** / **● MOCK** badge (from `/api/health`), so you always know whether
 real models are being called. Mock mode keeps every feature working — synthetic keyframes, Ken Burns clips,
-chord-progression music and speech-like voiceover audio — and `ADLOOP_MOCK_SPEED` (e.g. `0.3`) scales the simulated
+chord-progression music and speech-like voiceover audio — and `ADMATE_MOCK_SPEED` (e.g. `0.3`) scales the simulated
 latencies. The end-to-end check runs fully in-process (no port, no network):
 
 ```bash
-.venv/bin/python scripts/e2e_mock.py --inprocess --data-dir /tmp/adloop_e2e --mock-speed 0.3
+.venv/bin/python scripts/e2e_mock.py --inprocess --data-dir /tmp/admate_e2e --mock-speed 0.3
 ```
 
 ffmpeg: a system `ffmpeg` on `PATH` is used when present; otherwise the binary bundled with `imageio-ffmpeg`.
@@ -167,9 +185,9 @@ narration:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ADLOOP_MODEL_TTS` | `gemini-3.8-flash-tts` | voiceover model id |
-| `ADLOOP_TTS_CONCURRENCY` | `6` | max in-flight TTS calls (per-modality semaphore) |
-| `ADLOOP_TTS_PATH` | *(auto)* | pin the TTS API path (`generate_content` or `interactions`) to skip probing |
+| `ADMATE_MODEL_TTS` | `gemini-3.8-flash-tts` | voiceover model id |
+| `ADMATE_TTS_CONCURRENCY` | `6` | max in-flight TTS calls (per-modality semaphore) |
+| `ADMATE_TTS_PATH` | *(auto)* | pin the TTS API path (`generate_content` or `interactions`) to skip probing |
 
 ---
 
@@ -193,6 +211,9 @@ narration:
 | POST | `/api/runs/{id}/localize` | `{markets: [...]}` | per-market keyframes, score, native-language voiceover and narrated animatic |
 | POST | `/api/runs/{id}/final` | – | force re-stitch |
 | GET | `/api/showcase` | – | `{run_id}` for "Watch sample run" |
+| POST | `/api/runs/{id}/posters` | `{formats?, instruction?}` | regenerate all / selected poster formats |
+| POST | `/api/runs/{id}/posters/{format}/select` | `{idx}` | override a poster winner |
+| GET | `/api/runs/{id}/kit.zip` | – | the whole campaign kit as a ZIP |
 | GET | `/media/{run_id}/{file}` | – | generated asset |
 
 All mutating endpoints return `{"ok": true}` immediately; progress arrives on the event stream. Errors are
@@ -224,6 +245,11 @@ Every event carries `type`, `run_id` and `t` (ms since run start).
 | `metrics` | throughput, latency percentiles, in-flight counts (incl. `tts`), `voiceovers_generated`, `tts_p50_ms`, time-to-first-X, working API paths |
 | `log` / `error` | `level, msg` / `stage, msg` |
 | `run_done` | `wall_ms` (first final cut) |
+| `poster_status` | `status, format?, market?, error?` (kit-level when no format) |
+| `posters_copy` | `copy {headline, subline, cta, art_direction}` |
+| `poster_variant` | `format, idx, url, latency_ms, api_path` |
+| `poster` | `format, label, aspect, winner, url, score, rationale, by` |
+| `localize_poster` | `market, format, url, latency_ms` |
 
 ---
 
@@ -239,10 +265,13 @@ app/
   events.py        event bus: SSE fan-out + events.jsonl persistence + replay
   media.py         ffmpeg helpers: Ken Burns, normalize, crossfade, music fit, VO placement + ducking, WebVTT, stitch
   main.py          FastAPI app, HTTP API, rate limiting, static + media serving
-static/            vanilla-JS studio UI (index.html, app.js, styles.css) — no build step
+  posters.py       Campaign Kit plugin: event-driven poster fan-out, judge, localization, kit.zip (router + observer)
+  poster_prompts.py poster formats, layout recipes, copy / poster / judge / transcreation prompts
+static/            vanilla-JS studio UI (index.html, app.js, styles.css, posters.js/.css) — no build step
 scripts/
   smoke_test.py    live probe of every model (GenMedia or --raw SDK), table + artefacts
   e2e_mock.py      end-to-end mock-mode check (in-process ASGI or a running server)
+  e2e_posters.py   Campaign Kit end-to-end check (in-process)
   bench_nb2.py     NB2 Lite burst benchmark -> CSV
 deploy/            HF Spaces README, Render blueprint, HF push helper, DEPLOY.md
 data/runs/<id>/    run.json, events.jsonl and every generated asset (gitignored)

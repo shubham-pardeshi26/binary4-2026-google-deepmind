@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""AdLoop live model smoke test.
+"""AdMate live model smoke test.
 
-Probes every GenMedia model AdLoop depends on, in pipeline order, and reports
+Probes every GenMedia model AdMate depends on, in pipeline order, and reports
 which API path actually worked for each one. The model ids are new preview ids,
 so the printed output is how we learn the real API shape:
 
@@ -14,7 +14,7 @@ Two modes:
 
 * default   -- goes through ``app.genai_client.GenMedia`` exactly like the app
                does (adaptive fallbacks, path memory, retries). Works in mock
-               mode too (``ADLOOP_MOCK=1`` or ``--mock``), which is how we prove
+               mode too (``ADMATE_MOCK=1`` or ``--mock``), which is how we prove
                the harness end to end on a laptop without network.
 * ``--raw`` -- bypasses GenMedia and calls the google-genai SDK directly with
                the primary request shapes from CONTRACT section 1a, printing
@@ -63,12 +63,12 @@ STEPS = ("text", "image", "music", "tts", "video", "edit", "transcribe")
 # Contract defaults (CONTRACT section 1). Only used by --raw, which must work even
 # if app/ is broken; the GenMedia path reads the ids from app.config.settings.
 DEFAULT_MODELS = {
-    "text": ("ADLOOP_MODEL_TEXT", "gemini-3.8-flash"),
-    "image": ("ADLOOP_MODEL_IMAGE", "gemini-3.1-flash-lite-image"),
-    "video": ("ADLOOP_MODEL_VIDEO", "gemini-omni-1.1-flash"),
-    "music": ("ADLOOP_MODEL_MUSIC", "lyria-3.5"),
-    "transcribe": ("ADLOOP_MODEL_TRANSCRIBE", "gemini-3.5-transcribe"),
-    "tts": ("ADLOOP_MODEL_TTS", "gemini-3.8-flash-tts"),
+    "text": ("ADMATE_MODEL_TEXT", "gemini-3.8-flash"),
+    "image": ("ADMATE_MODEL_IMAGE", "gemini-3.1-flash-lite-image"),
+    "video": ("ADMATE_MODEL_VIDEO", "gemini-omni-1.1-flash"),
+    "music": ("ADMATE_MODEL_MUSIC", "lyria-3.5"),
+    "transcribe": ("ADMATE_MODEL_TRANSCRIBE", "gemini-3.5-transcribe"),
+    "tts": ("ADMATE_MODEL_TTS", "gemini-3.8-flash-tts"),
 }
 
 # Small fixed creative inputs so runs are comparable across days.
@@ -661,7 +661,7 @@ async def run_raw(args: argparse.Namespace, h: Harness, steps: list[str]) -> Non
 
 # -------------------------------------------------------------------------- main
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Live smoke test of every AdLoop model.")
+    p = argparse.ArgumentParser(description="Live smoke test of every AdMate model.")
     p.add_argument("--only", default=",".join(STEPS),
                    help=f"comma-separated subset of: {','.join(STEPS)} (default: all)")
     p.add_argument("--aspect", default="16:9", choices=["16:9", "9:16"])
@@ -670,7 +670,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--music-seconds", type=int, default=12)
     p.add_argument("--audio", help="path to a real speech recording for the transcribe probe")
     p.add_argument("--timeout", type=float, default=600.0, help="per-step timeout in seconds")
-    p.add_argument("--mock", action="store_true", help="force ADLOOP_MOCK=1 (offline harness check)")
+    p.add_argument("--mock", action="store_true", help="force ADMATE_MOCK=1 (offline harness check)")
     p.add_argument("--raw", action="store_true", help="bypass GenMedia; call the SDK directly and print raw responses")
     p.add_argument("--legacy-video", action="store_true", help="--raw only: also try models.generate_videos")
     args = p.parse_args(argv)
@@ -687,7 +687,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.mock:
-        os.environ["ADLOOP_MOCK"] = "1"
+        os.environ["ADMATE_MOCK"] = "1"
     out_dir = ROOT / "data" / "smoke" / datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
     h = Harness(out_dir, args.timeout)

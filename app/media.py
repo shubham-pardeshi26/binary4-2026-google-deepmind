@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-log = logging.getLogger("adloop.media")
+log = logging.getLogger("admate.media")
 
 FPS = 30
 #: Default per-command wall-clock limit for ffmpeg (seconds). A 6-scene 1080p stitch takes well under 60s.
@@ -213,7 +213,7 @@ async def ken_burns(image_bytes: bytes, seconds: int, aspect: str) -> bytes:
         f"zoompan=z='min(1+{zstep:.6f}*on,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
         f":d={frames}:s={w}x{h}:fps={FPS},setsar=1,format=yuv420p"
     )
-    with tempfile.TemporaryDirectory(prefix="adloop_kb_") as td:
+    with tempfile.TemporaryDirectory(prefix="admate_kb_") as td:
         src = Path(td) / "src.img"
         dst = Path(td) / "out.mp4"
         src.write_bytes(image_bytes)
@@ -294,7 +294,7 @@ def write_vtt(path: Path, cues: list[tuple[float, float, str]]) -> Path:
 
 # --------------------------------------------------------------------------- stitch
 def _keep_clip_audio() -> bool:
-    return os.getenv("ADLOOP_KEEP_CLIP_AUDIO", "0").strip().lower() in {"1", "true", "yes", "on"}
+    return os.getenv("ADMATE_KEEP_CLIP_AUDIO", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 _AFMT = "aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo"
@@ -391,7 +391,7 @@ async def stitch(clips: list[Path], music: Path | None, out: Path, *, aspect: st
     Audio: the music (EBU R128 -16 LUFS, padded/trimmed to the cut, 1.2s fade-out) is ducked under the narration.
     ``voiceovers`` is aligned with ``clips``: one ``(wav_path | None, duration_s)`` per scene (a missing line is
     simply silent); lines are placed by :func:`place_voiceovers`. Clip audio is dropped unless
-    ``ADLOOP_KEEP_CLIP_AUDIO=1`` (then mixed at 0.35). No music, narration or clip audio -> no audio stream.
+    ``ADMATE_KEEP_CLIP_AUDIO=1`` (then mixed at 0.35). No music, narration or clip audio -> no audio stream.
 
     Captions: when ``captions_out`` is given, a WebVTT file with one cue per placed line (text from ``captions``,
     aligned with ``clips``) is written next to the cut, timed exactly like the audio.

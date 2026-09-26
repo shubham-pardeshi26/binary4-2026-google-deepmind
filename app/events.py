@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-log = logging.getLogger("adloop.events")
+log = logging.getLogger("admate.events")
 
 #: Maximum number of undelivered events buffered per subscriber before it is considered stuck and dropped.
 SUBSCRIBER_QUEUE_SIZE = 2000

@@ -1,5 +1,5 @@
 /**
- * AdLoop · Campaign Kit plugin (POSTERS_CONTRACT §3).
+ * AdMate · Campaign Kit plugin (POSTERS_CONTRACT §3).
  *
  * A self-contained ES module that renders the "Campaign Kit — Nano Banana 2 Lite" section: print / social / web
  * posters in five formats (2 variants each, judged by Gemini Flash), a copy block, per-format regenerate and
@@ -16,7 +16,7 @@
  *
  * All model-provided text is inserted with text nodes (XSS-safe); every URL passes `safeUrl`.
  *
- * Public API (window.AdLoopPosters):
+ * Public API (window.AdMatePosters):
  *  - getState()            -> plain snapshot {runId, status, copy, items[], localized{}, count, elapsed_ms, error}
  *  - onChange(cb)          -> subscribe to snapshots after each render; returns an unsubscribe function
  *  - renderSlide(el)       -> draw a screen-share-ready "Campaign kit" poster wall into a presentation slide
@@ -94,6 +94,11 @@ function setText(el, text) {
 }
 
 /** Allow same-origin paths, http(s), blob: and data:image URLs only. */
+/** True when the "Behind the scenes" (technical) view is on. */
+function isPro() {
+  return document.body.classList.contains('pro');
+}
+
 function safeUrl(u) {
   if (typeof u !== 'string' || !u) return '';
   if (u.startsWith('/') && !u.startsWith('//')) return u;
@@ -154,7 +159,7 @@ async function api(path, json) {
   try {
     res = await fetch(path, opts);
   } catch {
-    throw Object.assign(new Error('Network error — is the AdLoop server running?'), { status: 0 });
+    throw Object.assign(new Error('Network error — is the AdMate server running?'), { status: 0 });
   }
   const text = await res.text();
   let body = null;
@@ -565,19 +570,19 @@ function mount() {
   const r = {};
   r.chip = h('span', { class: 'status-chip', dataset: { status: 'idle' } }, 'waiting');
   r.counter = h('span', { class: 'pk-counter mono' });
-  r.zip = h('a', { class: 'btn grad sm pk-zip', href: '#', download: 'campaign_kit.zip', title: 'Final cut, captions, music, voiceovers, keyframes, posters, localized assets, plan.json' }, '⬇ Download kit (.zip)');
+  r.zip = h('a', { class: 'btn grad sm pk-zip', href: '#', download: 'campaign_kit.zip', title: 'Your film, music, voice, pictures and posters in one .zip' }, '⬇ Download everything (.zip)');
   r.head = h(
     'div',
     { class: 'section-head pk-head' },
-    h('h2', {}, h('span', { class: 'step-no' }, 'KIT'), 'Campaign Kit ', h('span', { class: 'muted small' }, '— Nano Banana 2 Lite · print · social · web')),
-    h('div', { class: 'pk-head-right' }, r.chip, r.counter, r.zip),
+    h('h2', {}, h('span', { class: 'step-no' }, 'KIT'), 'Campaign Kit ', h('span', { class: 'muted small pro-only' }, '— Nano Banana 2 Lite · print · social · web'), h('span', { class: 'muted small simple-only' }, '— posters for social, print and web')),
+    h('div', { class: 'pk-head-right' }, r.chip, h('span', { class: 'pro-only' }, r.counter), r.zip),
   );
 
   r.headline = h('div', { class: 'pk-headline' });
   r.subline = h('div', { class: 'pk-subline' });
   r.cta = h('span', { class: 'cta-chip pk-cta' });
-  r.copyText = h('div', { class: 'pk-copy-text' }, h('span', { class: 'pk-eyebrow mono' }, 'POSTER COPY · rendered in-image by NB2'), r.headline, r.subline, r.cta);
-  r.kitInput = h('input', { type: 'text', maxlength: '300', placeholder: 'Restyle every poster… e.g. bolder type, night-time palette', 'aria-label': 'Instruction for regenerating all posters' });
+  r.copyText = h('div', { class: 'pk-copy-text' }, h('span', { class: 'pk-eyebrow mono pro-only' }, 'POSTER COPY · rendered in-image by NB2'), h('span', { class: 'pk-eyebrow mono simple-only' }, 'THE WORDS ON YOUR POSTERS'), r.headline, r.subline, r.cta);
+  r.kitInput = h('input', { type: 'text', maxlength: '300', placeholder: 'Want a different look? e.g. bolder text, night-time colours', 'aria-label': 'What should change on all posters' });
   r.kitBtn = h('button', { type: 'submit', class: 'btn sm ghost' }, '↻ All formats');
   r.kitForm = h('form', { class: 'pk-kit-form inline-form', autocomplete: 'off' }, r.kitInput, r.kitBtn);
   r.kitForm.addEventListener('submit', (e) => {
@@ -586,7 +591,7 @@ function mount() {
   });
   r.copy = h('div', { class: 'pk-copy' }, r.copyText);
 
-  r.note = h('p', { class: 'pk-note muted small' });
+  r.note = h('p', { class: 'pk-note muted small pro-only' });
   r.toolbar = h('div', { class: 'pk-toolbar' }, r.note, r.kitForm);
   r.error = h('p', { class: 'pk-error small', role: 'alert', hidden: true });
   r.tall = h('div', { class: 'pk-row pk-row-tall' });
@@ -597,7 +602,7 @@ function mount() {
   r.loc = h(
     'div',
     { class: 'pk-loc', hidden: true },
-    h('div', { class: 'pk-loc-head' }, h('h3', {}, 'Localized posters'), h('span', { class: 'muted small' }, 'NB2 edits of every winner · headline & CTA translated, layout and product kept')),
+    h('div', { class: 'pk-loc-head' }, h('h3', {}, 'Localized posters'), h('span', { class: 'muted small pro-only' }, 'NB2 edits of every winner · headline & CTA translated, layout and product kept'), h('span', { class: 'muted small simple-only' }, 'Your posters, adapted for each market')),
     r.locGrid,
   );
 
@@ -613,9 +618,9 @@ function buildCard(it) {
   c.img = h('img', { class: 'pk-img', alt: '', decoding: 'async', draggable: 'false' });
   c.img.addEventListener('load', () => c.img.classList.add('pk-in'));
   c.img.addEventListener('error', () => c.frame.classList.add('pk-broken'));
-  c.lat = h('span', { class: 'badge pk-lat mono' });
-  c.score = h('span', { class: 'badge pk-score mono' });
-  c.by = h('span', { class: 'badge pk-by' });
+  c.lat = h('span', { class: 'badge pk-lat mono pro-only' });
+  c.score = h('span', { class: 'badge pk-score mono pro-only' });
+  c.by = h('span', { class: 'badge pk-by pro-only' });
   c.state = h('span', { class: 'pk-state mono' });
   c.frame = h('button', { type: 'button', class: 'pk-frame' }, c.shimmer, c.img, c.lat, c.score, c.by, c.state);
   c.frame.addEventListener('click', () => {
@@ -625,8 +630,9 @@ function buildCard(it) {
   c.label = h('b', { class: 'pk-label' });
   c.ar = h('span', { class: 'pk-ar mono' });
   c.variants = h('div', { class: 'pk-variants', role: 'group', 'aria-label': 'Variants — click to make one the winner' });
-  c.regen = h('button', { type: 'button', class: 'btn xs ghost pk-regen', title: 'Regenerate this format (optional instruction)' }, '↻');
-  c.input = h('input', { type: 'text', maxlength: '300', placeholder: 'Optional: what should change?', 'aria-label': 'Regenerate instruction' });
+  c.regen = h('button', { type: 'button', class: 'btn xs ghost pk-regen', title: 'Make another version of this poster' }, '↻ Make another version');
+  c.dl = h('a', { class: 'btn xs ghost pk-dl', href: '#', download: `poster_${it.format}.png`, hidden: true }, '⬇ Download');
+  c.input = h('input', { type: 'text', maxlength: '300', placeholder: 'Optional: what should change?', 'aria-label': 'What should change on this poster' });
   c.form = h('form', { class: 'pk-regen-form', autocomplete: 'off', hidden: true }, c.input, h('button', { type: 'submit', class: 'btn xs grad' }, 'Go'));
   c.regen.addEventListener('click', () => {
     c.form.hidden = !c.form.hidden;
@@ -647,12 +653,12 @@ function buildCard(it) {
       c.form.hidden = true;
     }
   });
-  c.rationale = h('p', { class: 'pk-rationale' });
+  c.rationale = h('p', { class: 'pk-rationale pro-only' });
   c.meta = h(
     'div',
     { class: 'pk-meta' },
     h('div', { class: 'pk-title' }, c.label, c.ar),
-    h('div', { class: 'pk-actions' }, c.variants, c.regen),
+    h('div', { class: 'pk-actions' }, c.variants, c.dl, c.regen),
     c.form,
     c.rationale,
   );
@@ -693,6 +699,12 @@ function updateCard(c, it) {
   c.frame.disabled = !v?.url;
   c.shimmer.hidden = !((st === 'rendering' || st === 'judging') && (!v?.url || dimmed));
 
+  if (v?.url) {
+    const dlHref = safeUrl(v.url);
+    if (c.dl.getAttribute('href') !== dlHref) c.dl.setAttribute('href', dlHref);
+    c.dl.setAttribute('download', `poster_${it.format}.${extOf(v.url)}`);
+  }
+  c.dl.hidden = !v?.url;
   setText(c.lat, v?.latency_ms != null ? `⚡ ${fmtMs(v.latency_ms)}` : '');
   c.lat.title = v?.api_path ? `API path: ${v.api_path}` : '';
   const showWinner = it.winner != null && !it.stale && v?.idx === it.winner;
@@ -779,7 +791,7 @@ function renderLocalized(r) {
         cell.img = h('img', { alt: '', decoding: 'async', draggable: 'false' });
         cell.img.addEventListener('load', () => cell.img.classList.add('pk-in'));
         cell.shimmer = h('div', { class: 'pk-shimmer' });
-        cell.lat = h('span', { class: 'badge pk-lat mono' });
+        cell.lat = h('span', { class: 'badge pk-lat mono pro-only' });
         cell.cap = h('span', { class: 'pk-cell-cap mono' });
         cell.el = h('button', { type: 'button', class: 'pk-loc-cell' }, cell.shimmer, cell.img, cell.lat, cell.cap);
         cell.el.addEventListener('click', () => openLightbox({ kind: 'loc', market, format }));
@@ -831,7 +843,7 @@ function render() {
   // Header: status chip, live counter, kit link.
   const chipStatus = S.status === 'rendering' ? 'rendering' : S.status === 'done' ? 'done' : S.status === 'error' ? 'error' : 'idle';
   r.chip.dataset.status = chipStatus;
-  setText(r.chip, { rendering: 'rendering', done: 'kit ready', error: 'error', idle: 'waiting for storyboard' }[chipStatus]);
+  setText(r.chip, { rendering: 'designing…', done: 'ready', error: 'something went wrong', idle: 'waiting for your scenes' }[chipStatus]);
   const n = posterCount();
   const el = elapsedMs();
   setText(r.counter, n || el != null ? `${n} poster${n === 1 ? '' : 's'}${el != null ? ` · ${fmtMs(el)}` : ''}` : '');
@@ -851,7 +863,7 @@ function render() {
   if (!S.copy && S.status === 'rendering') setText(r.headline, 'Writing poster copy…');
   r.kitBtn.disabled = S.kitBusy || S.status === 'rendering';
   r.kitInput.disabled = S.kitBusy;
-  setText(r.kitBtn, S.status === 'idle' || S.status === 'error' ? '✦ Generate kit' : '↻ All formats');
+  setText(r.kitBtn, S.status === 'idle' || S.status === 'error' ? '✦ Make my posters' : '↻ Make another version');
 
   // Idle / error notes.
   const note =
@@ -861,7 +873,7 @@ function render() {
         ? `${VARIANTS_PER_FORMAT} variants per format in parallel, continuity-anchored to the hero keyframe · Gemini Flash judges legibility, brand, composition and impact.`
         : '';
   setText(r.note, note);
-  setText(r.error, S.error ? `Campaign kit error: ${S.error}` : '');
+  setText(r.error, S.error ? (document.body.classList.contains('pro') ? `Campaign kit error: ${S.error}` : 'We couldn\u2019t finish your posters. Try \u201cMake another version\u201d.') : '');
   r.error.hidden = !S.error;
 
   // Format cards, split into a tall row and a wide row; each row is justified (flex-grow ∝ aspect ratio).
@@ -971,7 +983,7 @@ function galleryList() {
       url: versioned(v.url, v.v),
       raw: v.url,
       title: it.label,
-      sub: [it.aspect, winner && it.score != null ? `score ${fmtScore(it.score)}` : '', winner ? (it.by === 'user' ? 'your pick' : 'judge winner') : `variant ${v.idx}`, v.latency_ms != null ? fmtMs(v.latency_ms) : ''].filter(Boolean).join(' · '),
+      sub: [it.aspect, isPro() && winner && it.score != null ? `score ${fmtScore(it.score)}` : '', winner ? (it.by === 'user' ? 'your pick' : isPro() ? 'judge winner' : 'our pick') : `option ${v.idx}`, isPro() && v.latency_ms != null ? fmtMs(v.latency_ms) : ''].filter(Boolean).join(' · '),
       rationale: winner ? it.rationale : '',
       filename: `poster_${it.format}.${extOf(v.url)}`,
     });
@@ -980,7 +992,7 @@ function galleryList() {
     for (const it of S.items.values()) {
       const p = row.get(it.format);
       if (!p?.url) continue;
-      out.push({ key: `loc:${market}:${it.format}`, url: versioned(p.url, p.v), raw: p.url, title: `${it.label} · ${market}`, sub: [it.aspect, 'localized', p.latency_ms != null ? fmtMs(p.latency_ms) : ''].filter(Boolean).join(' · '), rationale: '', filename: `poster_${slug(market)}_${it.format}.${extOf(p.url)}` });
+      out.push({ key: `loc:${market}:${it.format}`, url: versioned(p.url, p.v), raw: p.url, title: `${it.label} · ${market}`, sub: [it.aspect, 'localized', isPro() && p.latency_ms != null ? fmtMs(p.latency_ms) : ''].filter(Boolean).join(' · '), rationale: '', filename: `poster_${slug(market)}_${it.format}.${extOf(p.url)}` });
     }
   }
   return out;
@@ -991,8 +1003,8 @@ function buildLightbox() {
   r.img = h('img', { class: 'pk-lb-img', alt: '' });
   r.title = h('b', { class: 'pk-lb-title' });
   r.sub = h('span', { class: 'pk-lb-sub mono' });
-  r.rationale = h('p', { class: 'pk-lb-rationale' });
-  r.dl = h('a', { class: 'btn grad sm', href: '#', download: 'poster.png' }, '⬇ Download PNG');
+  r.rationale = h('p', { class: 'pk-lb-rationale pro-only' });
+  r.dl = h('a', { class: 'btn grad sm', href: '#', download: 'poster.png' }, '⬇ Download');
   r.open = h('a', { class: 'btn ghost sm', href: '#', target: '_blank', rel: 'noopener' }, 'Open ↗');
   r.prev = h('button', { type: 'button', class: 'pk-lb-nav prev', 'aria-label': 'Previous poster' }, '‹');
   r.next = h('button', { type: 'button', class: 'pk-lb-nav next', 'aria-label': 'Next poster' }, '›');
@@ -1097,7 +1109,7 @@ function drawSlide(el) {
         'div',
         { class: 'pk-slide-frame', style: { aspectRatio: `${ar.w} / ${ar.h}` } },
         v?.url ? h('img', { src: versioned(v.url, v.v), alt: it.label, decoding: 'async' }) : h('div', { class: 'pk-shimmer' }),
-        it.winner != null && it.score != null && !it.stale ? h('span', { class: 'badge pk-score mono' }, fmtScore(it.score)) : null,
+        it.winner != null && it.score != null && !it.stale ? h('span', { class: 'badge pk-score mono pro-only' }, fmtScore(it.score)) : null,
       ),
       h('figcaption', {}, h('b', {}, it.label), h('span', { class: 'mono muted' }, it.aspect)),
     );
@@ -1282,7 +1294,7 @@ function boot() {
   markDirty();
 }
 
-window.AdLoopPosters = Object.freeze({
+window.AdMatePosters = Object.freeze({
   /** Plain snapshot of the campaign kit for the current run. */
   getState: snapshot,
   /** Subscribe to state snapshots (called after each render). Returns an unsubscribe function. */

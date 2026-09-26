@@ -57,7 +57,7 @@ from app import media
 from app.events import EventBus
 from app.genai_client import GenResult
 
-log = logging.getLogger("adloop.pipeline")
+log = logging.getLogger("admate.pipeline")
 
 #: Debounce window for automatic re-stitches after the first final cut (CONTRACT §6.3).
 RESTITCH_DEBOUNCE_S = 1.5
@@ -270,8 +270,14 @@ class Run:
 
     # ------------------------------------------------------------------ plumbing
     def emit(self, type_: str, **payload: Any) -> dict:
-        """Emit one event on the run's bus (never raises)."""
-        return self.bus.emit(type_, **payload)
+        """Emit one event on the run's bus and notify the manager's observers (never raises)."""
+        event = self.bus.emit(type_, **payload)
+        for observer in list(getattr(self.manager, "observers", ())):
+            try:
+                observer(self, event)
+            except Exception:  # noqa: BLE001 - an observer must never break the pipeline
+                log.exception("run %s: event observer failed", self.id)
+        return event
 
     def save(self) -> None:
         """Persist ``run.json`` atomically. Called after every state change; never raises."""
@@ -1534,6 +1540,8 @@ class RunManager:
         self.data_dir = Path(settings.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.runs: dict[str, Run] = {}
+        #: Plugins notified of every emitted event: ``observer(run, event)`` (e.g. the Campaign Kit).
+        self.observers: list[Callable[[Run, dict], None]] = []
 
     # ------------------------------------------------------------------ lifecycle
     def load_existing(self) -> int:
@@ -1614,7 +1622,7 @@ class RunManager:
         return out
 
     def showcase_id(self) -> str | None:
-        env = os.getenv("ADLOOP_SHOWCASE_RUN", "").strip()
+        env = os.getenv("ADMATE_SHOWCASE_RUN", "").strip()
         if env and env in self.runs:
             return env
         done = [r for r in self.runs.values() if (r.state.get("final") or {}).get("url")]

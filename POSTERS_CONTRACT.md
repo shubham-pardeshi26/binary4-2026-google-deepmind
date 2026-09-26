@@ -1,4 +1,4 @@
-# AdLoop — Campaign Kit (posters) plugin contract
+# AdMate — Campaign Kit (posters) plugin contract
 
 > Separate workstream from CONTRACT.md §9 (v2 agents: ignore this file). Built as a **self-contained plugin** in NEW files only, because
 > other engineers are concurrently editing app/pipeline.py, app/main.py, app/events.py, app/genai_client.py, app/prompts.py, static/app.js,
@@ -58,7 +58,7 @@ winning poster into that market's language/script (headline/CTA translated, layo
   click → lightbox with full-size + PNG download); a "Localized posters" grid market × format from `localize_poster`.
 - Style: reuse the CSS variables/fonts defined in static/styles.css (read it: e.g. --grad, --panel, --border, font vars) so it looks native; all
   model text escaped (XSS-safe).
-- Expose `window.AdLoopPosters = { getState(), onChange(cb), renderSlide(el) }` — `renderSlide` draws a screen-share-ready "Campaign kit" poster
+- Expose `window.AdMatePosters = { getState(), onChange(cb), renderSlide(el) }` — `renderSlide` draws a screen-share-ready "Campaign kit" poster
   wall into a presentation slide element (used later by app.js presentation mode).
 
 ## 4. Tests
@@ -73,4 +73,4 @@ localize 1 market → localize_poster per format, kit.zip downloads and contains
   event inside try/except (logged, never raises).
 - app/main.py: import `PosterStudio`, `router`; in lifespan after the manager is created: `studio = PosterStudio(manager); manager.observers.append(studio.on_event); app.state.posters = studio`; `app.include_router(posters_router)`.
 - static/index.html: `<link rel="stylesheet" href="/static/posters.css">`, `<section id="posters-mount"></section>` after the final cut section, `<script type="module" src="/static/posters.js"></script>`.
-- static/app.js presentation mode: insert a "Campaign kit" slide before the stats slide that calls `window.AdLoopPosters?.renderSlide(slideEl)`.
+- static/app.js presentation mode: insert a "Campaign kit" slide before the stats slide that calls `window.AdMatePosters?.renderSlide(slideEl)`.

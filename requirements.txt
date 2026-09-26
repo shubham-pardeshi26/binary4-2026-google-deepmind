@@ -1,4 +1,4 @@
-# AdLoop runtime dependencies.
+# AdMate runtime dependencies.
 # Lower bounds = the versions the app was built and tested against (see .venv);
 # upper bounds = next major, so a fresh `pip install` cannot silently pick up a breaking release.
 

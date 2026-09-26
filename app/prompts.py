@@ -1,4 +1,4 @@
-"""Creative direction for AdLoop: prompts, JSON schemas and high-level model calls.
+"""Creative direction for AdMate: prompts, JSON schemas and high-level model calls.
 
 This module is where output *quality* is won. It never touches the Google SDK —
 every call goes through :class:`app.genai_client.GenMedia` — and it owns:

@@ -1,5 +1,5 @@
 /**
- * AdLoop studio front-end (CONTRACT §8).
+ * AdMate studio front-end (CONTRACT §8).
  *
  * Architecture (no framework, no build step):
  *   - One state store (`store.run`) shaped exactly like `GET /api/runs/{id}` (CONTRACT §6).
@@ -124,7 +124,7 @@ const SLIDE_TIMED_MS = 4000;
 const FONTS_URL = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap';
 
 /** localStorage key for the telemetry drawer's open/closed choice (default: closed). */
-const TELE_KEY = 'adloop.telemetry';
+const TELE_KEY = 'admate.telemetry';
 
 /** A manual scroll suppresses automatic scrolling for this long. */
 const MANUAL_SCROLL_GRACE_MS = 10000;
@@ -304,6 +304,10 @@ function safeColor(c) {
 
 const clamp01 = (x) => Math.max(0, Math.min(1, Number(x) || 0));
 
+/** Pro ("Behind the scenes") view shows the technical details; the simple view is the default. */
+const isPro = () => document.body.classList.contains('pro');
+const PRO_KEY = 'admate.pro';
+
 /** Map energy 0..1 onto the signature gradient violet → magenta → amber. */
 function energyColor(e) {
   const stops = [
@@ -348,7 +352,7 @@ async function api(path, { method = 'GET', json, form } = {}) {
   try {
     res = await fetch(path, opts);
   } catch {
-    throw new ApiError('Network error — is the AdLoop server running?', 0);
+    throw new ApiError('Network error — is the AdMate Studio server running?', 0);
   }
   const text = await res.text();
   let body = null;
@@ -376,7 +380,7 @@ async function act(label, fn, { button, success } = {}) {
     if (success) toast(success, 'ok');
     return out ?? {};
   } catch (err) {
-    toast(`${label}: ${err?.message || err}`, 'error');
+    toast(isPro() ? `${label}: ${err?.message || err}` : `Sorry, that didn't work (${label.toLowerCase()}). Please try again.`, 'error');
     return null;
   } finally {
     if (button) button.disabled = false;
@@ -429,7 +433,7 @@ function notifyError(stage, rawMsg) {
   if (!firstWithin(`err|${stage}|${sceneId || ''}`, 4000)) return;
   const noun = STAGE_NOUN[stage] || stage || 'pipeline';
   const who = sceneId && store.run ? `${sceneLabel(store.run, sceneId)} ` : '';
-  toast(`${who}${noun} failed: ${msg}`, 'error');
+  toast(isPro() ? `${who}${noun} failed: ${msg}` : `${who ? `${who}: s` : 'S'}omething went wrong, but we're carrying on. You can ask for a change to retry.`, 'error');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -880,7 +884,7 @@ const REDUCERS = {
       if (e.plan) existing.plan = e.plan;
       if (e.seq != null) existing._seq = e.seq;
     } else {
-      run.directions.push({ instruction: e.instruction || '', summary: e.summary || '', plan: e.plan || null, ts: e.t, _seq: e.seq });
+      run.directions.push({ instruction: e.instruction || '', summary: e.summary || '', plan: e.plan || null, ts: e.t, _seq: e.seq, _finalV: ui.replay ? null : run.final?.version ?? null });
     }
     if (ui.pendingDirect && (!e.instruction || e.instruction === ui.pendingDirect)) ui.pendingDirect = null;
     ui.directError = null;
@@ -1089,7 +1093,7 @@ async function openRun(id, { replay = false, shell = null, speed = REPLAY_SPEED 
   }
   markDirty();
   connect(id, { replay, speed });
-  if (replay) window.AdLoopPosters?.attach?.(id, { replay: true, speed });
+  if (replay) window.AdMatePosters?.attach?.(id, { replay: true, speed });
 }
 
 function initClock(run) {
@@ -1146,6 +1150,7 @@ function renderAll() {
   safely('telemetry', renderTelemetry);
   if (!run) {
     $('#director-bar').hidden = true;
+    $('#chat-panel').hidden = true;
     return;
   }
   $('#run-view').classList.toggle('portrait', isPortrait(run));
@@ -1159,6 +1164,8 @@ function renderAll() {
   safely('banner', renderCutBanner);
   safely('localize', renderLocalize);
   safely('director', renderDirectorBar);
+  safely('progress', renderProgress);
+  safely('chat', renderChat);
   safely('present', refreshPresentation);
   safely('flights', flyWinners);
   tick();
@@ -1446,9 +1453,10 @@ function renderPlan() {
       h(
         'div',
         { class: 'plan-pending' },
-        h('div', { class: 'eyebrow mono' }, '01 · CREATIVE DIRECTOR · GEMINI FLASH'),
+        h('div', { class: 'eyebrow mono pro-only' }, '01 · CREATIVE DIRECTOR · GEMINI FLASH'),
+        h('div', { class: 'eyebrow mono simple-only' }, 'PLANNING YOUR CAMPAIGN'),
         run.status === 'error'
-          ? h('p', { class: 'err-text' }, 'The director could not produce a plan. Check the event log.')
+          ? h('p', { class: 'err-text' }, 'We couldn\'t plan this ad. Please try again or reword your description.')
           : [h('div', { class: 'sk-line w60' }), h('div', { class: 'sk-line w40' }), h('div', { class: 'sk-line w80' }), h('p', { class: 'muted small' }, 'Writing the brand bible, scene beats and music brief…')],
       ),
     );
@@ -1463,7 +1471,8 @@ function renderPlan() {
     h(
       'div',
       { class: 'plan-main' },
-      h('div', { class: 'eyebrow mono' }, `01 · CREATIVE PLAN · GEMINI FLASH${ms ? ` · ${fmtMs(ms)}` : ''}`),
+      h('div', { class: 'eyebrow mono pro-only' }, `01 · CREATIVE PLAN · GEMINI FLASH${ms ? ` · ${fmtMs(ms)}` : ''}`),
+      h('div', { class: 'eyebrow mono simple-only' }, 'YOUR CAMPAIGN'),
       h('h2', { class: 'plan-title grad-text' }, plan.campaign_name || 'Untitled campaign'),
       plan.tagline ? h('p', { class: 'plan-tagline' }, `“${plan.tagline}”`) : null,
       h(
@@ -1476,13 +1485,13 @@ function renderPlan() {
         ? h(
             'div',
             { class: 'palette' },
-            palette.map((c) => h('div', { class: 'swatch', style: { '--c': c }, title: c }, h('span', { class: 'mono' }, c.toUpperCase()))),
+            palette.map((c) => h('div', { class: 'swatch', style: { '--c': c }, title: c }, h('span', { class: 'mono pro-only' }, c.toUpperCase()))),
           )
         : null,
     ),
     h(
       'div',
-      { class: 'plan-facts' },
+      { class: 'plan-facts pro-only' },
       fact('Visual style', brand.visual_style),
       fact('Mood', brand.mood),
       fact('Typography', brand.typography),
@@ -1544,11 +1553,14 @@ function createSceneRow(s) {
         { class: 'scene-titles' },
         h('h3', { class: 'scene-title' }),
         h('div', { class: 'scene-sub' }, h('span', { class: 'beat-chip' }), h('span', { class: 'scene-mood' }), h('span', { class: 'energy' }, h('i'))),
+        h('p', { class: 'scene-narr simple-only' }),
       ),
       h('span', { class: 'scene-status mono' }),
-      h('button', { class: 'btn ghost xs regen-btn', type: 'button', title: 'New NB2 round for this scene' }, '↻ regenerate'),
+      h('button', { class: 'btn ghost xs alts-btn simple-only', type: 'button', title: 'See the other picture options for this scene' }, 'See alternatives'),
+      h('button', { class: 'btn ghost xs regen-btn', type: 'button', title: 'New NB2 round for this scene' }, '↻ New pictures'),
     ),
     regenForm,
+    h('p', { class: 'alts-hint muted simple-only' }, 'Click any picture to use it for this scene.'),
     h('div', { class: 'lanes' }),
     h('p', { class: 'judge-note' }),
   );
@@ -1557,6 +1569,10 @@ function createSceneRow(s) {
     if (!regenForm.hidden) regenInput.focus();
   });
   $('.regen-cancel', row).addEventListener('click', () => (regenForm.hidden = true));
+  $('.alts-btn', row).addEventListener('click', () => {
+    const on = row.classList.toggle('show-alts');
+    setText($('.alts-btn', row), on ? 'Hide alternatives' : 'See alternatives');
+  });
   regenForm.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const sid = row.dataset.key;
@@ -1582,7 +1598,7 @@ function updateSceneRow(row, s, run, K) {
   const i = run.scenes.indexOf(s);
   cls(row, 'skeleton', s._skeleton);
   setText($('.scene-no', row), s._skeleton ? `S${Number(s.id.slice(3)) + 1}` : `S${i + 1}`);
-  setText($('.scene-title', row), s._skeleton ? 'Director is writing this beat…' : s.title || s.id);
+  setText($('.scene-title', row), s._skeleton ? (isPro() ? 'Director is writing this beat…' : 'Writing this scene…') : s.title || s.id);
   const beat = $('.beat-chip', row);
   setText(beat, s.beat || '');
   beat.hidden = !s.beat;
@@ -1595,6 +1611,12 @@ function updateSceneRow(row, s, run, K) {
   bar.style.background = energyColor(s.energy);
   en.title = `energy ${Number(s.energy ?? 0).toFixed(2)}`;
   $('.regen-btn', row).hidden = s._skeleton || !winnerDecided(s);
+  cls(row, 'decided', !s._skeleton && winnerDecided(s));
+  $('.alts-btn', row).hidden = s._skeleton || !winnerDecided(s);
+  const narr = $('.scene-narr', row);
+  const narrText = s.voiceover?.text || s.narration || '';
+  setText(narr, narrText ? `“${narrText}”` : '');
+  narr.hidden = !narrText;
 
   // Status text for the row.
   const status = $('.scene-status', row);
@@ -1611,6 +1633,12 @@ function updateSceneRow(row, s, run, K) {
     busy = false;
     const sc = winnerScore(s);
     st = `♛ #${(s.winner ?? 0) + 1}${sc != null ? ` · ${fmtScore(sc)}` : ''}${s._winnerBy === 'user' ? ' · your pick' : ''}`;
+  }
+  if (!isPro()) {
+    if (s._skeleton) st = 'Planning…';
+    else if (!s.judge.length) st = 'Designing…';
+    else if (s._pendingRepair || ui.pendingRegen[s.id]) st = 'Improving…';
+    else if (!busy) st = s._winnerBy === 'user' ? 'Your pick ✓' : 'Chosen ✓';
   }
   setText(status, st);
   cls(status, 'busy', busy && run.status !== 'error');
@@ -1773,7 +1801,7 @@ async function onTileClick(tile) {
   s._winnerBy = 'user';
   markDirty();
   const ok = await act('Select winner', () => api(`/api/runs/${store.runId}/scenes/${encodeURIComponent(sid)}/select`, { method: 'POST', json: { idx } }));
-  if (ok) toast(`${sceneLabel(run, sid)}: you picked #${idx + 1} — re-rendering the shot`, 'info');
+  if (ok) toast(isPro() ? `${sceneLabel(run, sid)}: you picked #${idx + 1} — re-rendering the shot` : `${sceneLabel(run, sid)}: using your picture, filming it now…`, 'info');
   else {
     s.winner = prev.winner;
     s._winnerBy = prev.by;
@@ -1856,8 +1884,8 @@ function renderMotion() {
 let pendingEditSeq = 0;
 
 function createClipCard(s) {
-  const input = h('input', { type: 'text', maxLength: 300, placeholder: 'Direct this shot…' });
-  const form = h('form', { class: 'clip-form' }, input, h('button', { class: 'btn grad xs', type: 'submit', title: 'Send edit to Omni' }, '↗'));
+  const input = h('input', { type: 'text', maxLength: 300, placeholder: 'Ask for a change… e.g. make it brighter' });
+  const form = h('form', { class: 'clip-form' }, input, h('button', { class: 'btn grad xs', type: 'submit', title: 'Send this change' }, '↗'));
   const ring = progressRing(64);
   const card = h(
     'article',
@@ -1869,23 +1897,25 @@ function createClipCard(s) {
       h('video', { muted: true, loop: true, autoplay: true, playsInline: true, preload: 'auto' }),
       h('div', { class: 'clip-overlay' }, ring.el, h('span', { class: 'ring-label mono' }), h('span', { class: 'ring-sub mono' })),
       h('span', { class: 'clip-label' }),
-      h('span', { class: 'badge lat mono clip-lat' }),
+      h('span', { class: 'badge lat mono clip-lat pro-only' }),
     ),
-    h('div', { class: 'clip-bar' }, h('span', { class: 'status-chip' }), h('div', { class: 'pills' })),
+    h('div', { class: 'clip-bar' }, h('span', { class: 'status-chip' }), h('div', { class: 'pills pro-only' })),
     h(
       'div',
       { class: 'vo' },
       h(
         'div',
         { class: 'vo-head' },
-        h('span', { class: 'vo-tag mono' }, 'VO'),
+        h('span', { class: 'vo-tag mono pro-only' }, 'VO'),
+        h('span', { class: 'vo-label simple-only' }, 'What the narrator says'),
         h('span', { class: 'vo-status mono' }),
         h('button', { class: 'vo-play', type: 'button', title: 'Preview this narration take', 'aria-label': 'Preview narration' }, '▶'),
-        h('button', { class: 'btn ghost xs vo-send', type: 'button', title: 'Re-voice this line with Flash TTS (Enter)' }, '↻ re-voice'),
+        h('button', { class: 'btn ghost xs vo-send', type: 'button', title: 'Record this line again (Enter)' }, 'Update voice'),
       ),
       h('textarea', { class: 'vo-text', rows: 2, maxLength: 300, placeholder: 'Narration for this scene…', 'aria-label': 'Voiceover line' }),
     ),
     h('ol', { class: 'clip-chat' }),
+    h('span', { class: 'ask-label simple-only' }, 'Ask for a change'),
     form,
     h(
       'div',
@@ -1973,6 +2003,7 @@ function updateVoiceBlock(card, s) {
           ? `take ${vo.v || 1} · ${vo.duration_s ? `${Number(vo.duration_s).toFixed(1)} s · ` : ''}${fmtMs(vo.latency_ms)}`
           : vo.text ? 'waiting for Flash TTS' : 'narration arrives with the plan',
   );
+  if (!isPro()) setText(status, vo.status === 'error' ? 'couldn\'t record' : busy ? 'recording…' : vo.url ? 'ready' : '');
   status.title = vo.error || '';
   const play = $('.vo-play', card);
   play.disabled = !vo.url;
@@ -2029,7 +2060,15 @@ function updateClipCard(card, s, run) {
             : win
               ? 'waiting for Omni'
               : 'waiting for winner';
-  setText(chip, label);
+  const simpleLabel =
+    c.status === 'queued' || c.status === 'rendering'
+      ? ver ? 'Updating…' : 'Filming…'
+      : c.status === 'error'
+        ? 'Couldn\'t film this scene'
+        : c.status === 'done' || ver
+          ? c.lastError ? 'Ready · last change didn\'t work' : 'Ready'
+          : 'Waiting…';
+  setText(chip, isPro() ? label : simpleLabel);
   chip.title = c.error || c.lastError || '';
 
   // Version pills.
@@ -2061,7 +2100,7 @@ function updateClipCard(card, s, run) {
       key: `p${p.id}`,
       text: p.instruction,
       out: p.failed ? '✕' : '…',
-      meta: p.failed ? `failed · ${truncate(p.error, 60)}` : 'Omni editing',
+      meta: p.failed ? `failed · ${truncate(p.error, 60)}` : isPro() ? 'Omni editing' : 'working on it…',
       pending: !p.failed,
       failed: p.failed,
     })),
@@ -2072,13 +2111,13 @@ function updateClipCard(card, s, run) {
     chatEl,
     chat,
     (m) => m.key,
-    (m) => h('li', { class: 'msg' }, h('span', { class: 'msg-text' }), h('span', { class: 'msg-out mono' }), h('span', { class: 'msg-meta mono' })),
+    (m) => h('li', { class: 'msg' }, h('span', { class: 'msg-text' }), h('span', { class: 'msg-out mono pro-only' }), h('span', { class: 'msg-meta mono' })),
     (el, m) => {
       cls(el, 'pending', m.pending);
       cls(el, 'failed', m.failed);
       setText($('.msg-text', el), `“${m.text}”`);
       setText($('.msg-out', el), `→ ${m.out}`);
-      setText($('.msg-meta', el), m.meta);
+      setText($('.msg-meta', el), isPro() ? m.meta : m.failed ? 'didn\'t work' : m.pending ? 'working on it…' : '✓ done');
     },
   );
   const canEdit = !!win || c.versions.length > 0;
@@ -2099,7 +2138,7 @@ function renderMusic() {
   const cur = vs.find((x) => x.v === ui.musicView) || vs[vs.length - 1] || null;
   const chip = $('.status-chip', panel);
   chip.dataset.status = m.status;
-  setText(chip, m.status === 'rendering' ? `scoring${m._reason ? ` · ${m._reason}` : ''}` : m.status === 'error' ? `error: ${truncate(m.error, 50)}` : cur ? `v${cur.v} ready` : 'waiting for plan');
+  setText(chip, !isPro() ? (m.status === 'rendering' ? 'Composing…' : m.status === 'error' ? 'Couldn\'t make music' : cur ? 'Ready' : 'Waiting…') : m.status === 'rendering' ? `scoring${m._reason ? ` · ${m._reason}` : ''}` : m.status === 'error' ? `error: ${truncate(m.error, 50)}` : cur ? `v${cur.v} ready` : 'waiting for plan');
   const audio = $('audio', panel);
   // A new score version replaces the old one mid-listen: keep playing on the new take.
   const wasPlaying = !audio.paused && !audio.ended;
@@ -2154,18 +2193,18 @@ function renderMusic() {
 
 function buildMusicPanel(panel) {
   panel.dataset.built = '1';
-  const input = h('input', { type: 'text', maxLength: 300, placeholder: 'Re-score with a note… e.g. more tabla, warmer ending' });
-  const form = h('form', { class: 'inline-form' }, input, h('button', { class: 'btn ghost sm', type: 'submit' }, '♫ Re-score'));
+  const input = h('input', { type: 'text', maxLength: 300, placeholder: 'Change the music… e.g. more tabla, warmer ending' });
+  const form = h('form', { class: 'inline-form' }, input, h('button', { class: 'btn ghost sm', type: 'submit' }, '♫ Change the music'));
   const audio = h('audio', { controls: true, preload: 'auto' });
   const playhead = h('div', { class: 'playhead' });
   panel.replaceChildren(
-    h('div', { class: 'section-head' }, h('h2', {}, h('span', { class: 'step-no' }, '05'), 'Soundtrack ', h('span', { class: 'muted small' }, 'Lyria 3.5 · adaptive')), h('span', { class: 'status-chip' })),
-    h('div', { class: 'music-skel' }, h('div', { class: 'eq' }, Array.from({ length: 24 }, () => h('i'))), h('span', { class: 'muted small' }, 'Lyria starts scoring the moment the plan lands…')),
+    h('div', { class: 'section-head' }, h('h2', {}, h('span', { class: 'step-no pro-only' }, '05'), h('span', { class: 'simple-only' }, '♫ '), 'Soundtrack ', h('span', { class: 'muted small pro-only' }, 'Lyria 3.5 · adaptive')), h('span', { class: 'status-chip' })),
+    h('div', { class: 'music-skel' }, h('div', { class: 'eq' }, Array.from({ length: 24 }, () => h('i'))), h('span', { class: 'muted small pro-only' }, 'Lyria starts scoring the moment the plan lands…'), h('span', { class: 'muted small simple-only' }, 'Composing your music…')),
     h('div', { class: 'audio-wrap' }, audio),
-    h('p', { class: 'rescore-why mono', hidden: true }),
-    h('div', { class: 'timeline-wrap' }, h('div', { class: 'tl-label mono muted' }, 'MOOD TIMELINE'), h('div', { class: 'tl-track' }, h('div', { class: 'mood-timeline' }), playhead)),
-    h('ol', { class: 'music-versions' }),
-    h('details', { class: 'prompt-details' }, h('summary', {}, 'Lyria prompt'), h('pre', { class: 'music-prompt mono' })),
+    h('p', { class: 'rescore-why mono pro-only', hidden: true }),
+    h('div', { class: 'timeline-wrap pro-only' }, h('div', { class: 'tl-label mono muted' }, 'MOOD TIMELINE'), h('div', { class: 'tl-track' }, h('div', { class: 'mood-timeline' }), playhead)),
+    h('ol', { class: 'music-versions pro-only' }),
+    h('details', { class: 'prompt-details pro-only' }, h('summary', {}, 'Lyria prompt'), h('pre', { class: 'music-prompt mono' })),
     form,
   );
   audio.addEventListener('timeupdate', () => {
@@ -2188,7 +2227,7 @@ function buildMusicPanel(panel) {
     if (ok) {
       ui.pendingMusic = true;
       input.value = '';
-      toast('Lyria is re-scoring…', 'info');
+      toast(isPro() ? 'Lyria is re-scoring…' : 'Changing the music…', 'info');
       markDirty();
     }
   });
@@ -2219,13 +2258,15 @@ function renderFinal() {
   waiting.hidden = has;
   const chip = $('.status-chip', panel);
   chip.dataset.status = f.status;
-  setText(chip, f.status === 'rendering' ? 'stitching…' : f.status === 'error' ? `error: ${truncate(f.error, 50)}` : has ? `v${f.version} · ${Number(f.duration_s || 0).toFixed(1)} s` : 'waiting');
+  setText(chip, !isPro() ? (f.status === 'rendering' ? 'Putting it together…' : f.status === 'error' ? 'Couldn\'t finish the video' : has ? `Ready · ${Math.round(Number(f.duration_s || 0))} s` : 'Waiting…') : f.status === 'rendering' ? 'stitching…' : f.status === 'error' ? `error: ${truncate(f.error, 50)}` : has ? `v${f.version} · ${Number(f.duration_s || 0).toFixed(1)} s` : 'waiting');
   if (!has) {
     const clips = run.scenes.filter((s) => s.clip.versions.length).length;
     const voiced = run.scenes.filter((s) => s.voiceover.url || s.voiceover.status === 'error').length;
     setText(
       $('.wait-text', panel),
-      f.status === 'rendering'
+      !isPro()
+        ? f.status === 'rendering' ? 'Putting your scenes, music and voice together…' : `Your ad appears here once every scene, the music and the voice are ready (${clips}/${run.scenes.length || '—'} scenes filmed).`
+        : f.status === 'rendering'
         ? 'ffmpeg is cutting clips, score and narration together…'
         : `Auto-stitches when every clip, the score and the narration are ready · clips ${clips}/${run.scenes.length || '—'} · score ${run.music.versions.length ? '✓' : '…'} · voice ${voiced}/${run.scenes.length || '—'}`,
     );
@@ -2234,8 +2275,11 @@ function renderFinal() {
   dl.hidden = !has;
   if (has) {
     dl.href = safeUrl(url);
-    dl.download = `${(run.plan?.campaign_name || 'adloop').replace(/[^\w-]+/g, '_').slice(0, 40)}_v${f.version || 1}.mp4`;
+    dl.download = `${(run.plan?.campaign_name || 'admate').replace(/[^\w-]+/g, '_').slice(0, 40)}_v${f.version || 1}.mp4`;
   }
+  const kit = $('.kit-btn', panel);
+  kit.hidden = !has;
+  if (has) kit.href = `/api/runs/${encodeURIComponent(store.runId)}/kit.zip`;
   $('.present-btn', panel).disabled = !run.plan;
   $('.restitch-btn', panel).disabled = !run.scenes.some((s) => s.clip.versions.length);
 }
@@ -2329,15 +2373,16 @@ function buildFinalPanel(panel) {
   panel.dataset.built = '1';
   const video = h('video', { controls: true, playsInline: true, preload: 'metadata' });
   panel.replaceChildren(
-    h('div', { class: 'section-head' }, h('h2', {}, h('span', { class: 'step-no' }, '06'), 'Final cut'), h('span', { class: 'status-chip' })),
+    h('div', { class: 'section-head' }, h('h2', {}, h('span', { class: 'step-no pro-only' }, '06'), h('span', { class: 'pro-only' }, 'Final cut'), h('span', { class: 'simple-only' }, '🎬 Your ad')), h('span', { class: 'status-chip' })),
     h('div', { class: 'final-player' }, video),
     h('div', { class: 'final-wait' }, h('div', { class: 'shimmer' }), h('span', { class: 'wait-text muted small' })),
     h(
       'div',
       { class: 'final-actions' },
       h('button', { class: 'btn grad present-btn', type: 'button' }, '▶ Present'),
-      h('a', { class: 'btn ghost dl-btn', href: '#', download: 'adloop.mp4' }, '⬇ Download'),
-      h('button', { class: 'btn ghost restitch-btn', type: 'button', title: 'Force a re-stitch' }, '↻ Re-stitch'),
+      h('a', { class: 'btn ghost dl-btn', href: '#', download: 'admate.mp4' }, '⬇ Download video'),
+      h('a', { class: 'btn ghost kit-btn', href: '#', download: 'admate_kit.zip', title: 'Video, posters, music and voice in one .zip' }, '⬇ Download everything'),
+      h('button', { class: 'btn ghost restitch-btn pro-only', type: 'button', title: 'Force a re-stitch' }, '↻ Re-stitch'),
     ),
   );
   $('.present-btn', panel).addEventListener('click', () => openPresentation());
@@ -2360,7 +2405,7 @@ function renderLocalize() {
   for (const b of $$('.chip', chips)) cls(b, 'on', ui.locMarkets.has(b.dataset.market));
   const go = $('.loc-go', panel);
   go.disabled = !ui.locMarkets.size || !run.scenes.some(winnerDecided);
-  setText(go, ui.locMarkets.size ? `Localize ${ui.locMarkets.size} market${ui.locMarkets.size > 1 ? 's' : ''} ↗` : 'Pick markets');
+  setText(go, ui.locMarkets.size ? `${isPro() ? 'Localize' : 'Create for'} ${ui.locMarkets.size} market${ui.locMarkets.size > 1 ? 's' : ''} ↗` : 'Pick markets');
 
   const markets = Object.keys(run.localizations);
   $('.loc-empty', panel).hidden = markets.length > 0;
@@ -2383,7 +2428,7 @@ function createLocRow(m) {
     h(
       'div',
       { class: 'loc-body' },
-      h('div', { class: 'loc-video-wrap' }, video, h('span', { class: 'loc-video-cap mono muted' })),
+      h('div', { class: 'loc-video-wrap' }, video, h('span', { class: 'loc-video-cap mono muted pro-only' })),
       h('div', { class: 'loc-side' }, h('div', { class: 'loc-tiles' }), h('ol', { class: 'loc-vo' })),
     ),
   );
@@ -2413,6 +2458,7 @@ function updateLocRow(el, m, run) {
         ? `${done} frames${loc.voiceover.length ? ` · ${loc.voiceover.length} lines` : ''}${loc.video_url ? ' · animatic' : ''}`
         : `${loc.status || 'working'} · ${done}/${run.scenes.length}`,
   );
+  if (!isPro()) setText(chip, loc.status === 'error' ? 'Couldn\'t finish' : loc.status === 'done' ? 'Ready' : `Working… ${done}/${run.scenes.length}`);
   const audio = $('.loc-audio', el);
   setSrc(audio, loc.music_url);
   audio.hidden = !loc.music_url;
@@ -2482,9 +2528,9 @@ function buildLocalizePanel(panel) {
   );
   const go = h('button', { class: 'btn grad sm loc-go', type: 'button' }, 'Localize');
   panel.replaceChildren(
-    h('div', { class: 'section-head' }, h('h2', {}, h('span', { class: 'step-no' }, '07'), 'Localize ', h('span', { class: 'muted small' }, 'NB2 keyframes · Lyria regional score · Flash TTS narration · animatic')), go),
+    h('div', { class: 'section-head' }, h('h2', {}, h('span', { class: 'step-no pro-only' }, '07'), h('span', { class: 'pro-only' }, 'Localize '), h('span', { class: 'simple-only' }, '🌍 Make it for other markets '), h('span', { class: 'muted small pro-only' }, 'NB2 keyframes · Lyria regional score · Flash TTS narration · animatic')), go),
     chips,
-    h('p', { class: 'loc-empty muted small' }, 'Pick markets — each one fans out in parallel: translated on-image text, culturally adapted cast & setting, same composition and product.'),
+    h('p', { class: 'loc-empty muted small' }, h('span', { class: 'pro-only' }, 'Pick markets — each one fans out in parallel: translated on-image text, culturally adapted cast & setting, same composition and product.'), h('span', { class: 'simple-only' }, 'Pick the countries you want. Each gets its own version: translated text and voice, local music, and people and places that fit.')),
     h('div', { class: 'loc-grid' }),
   );
   chips.addEventListener('click', (ev) => {
@@ -2607,6 +2653,129 @@ async function submitDirection(instruction) {
       }
     }, 60000);
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 11b. Simple view: friendly progress card + "Chat with your studio"
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PROGRESS_STEPS = ['Planning your campaign', 'Designing scenes', 'Filming', 'Adding music & voice', 'Your ad is ready'];
+
+function renderProgress() {
+  const run = store.run;
+  const n = run.scenes.length || Number(run.input.n_scenes) || 4;
+  const decided = run.scenes.filter(winnerDecided).length;
+  const filmed = run.scenes.filter((s) => s.clip.versions.length).length;
+  const voiced = run.scenes.filter((s) => s.voiceover.url || s.voiceover.status === 'error').length;
+  const scored = run.music.versions.length > 0 || run.music.status === 'error';
+  const done = !!run.final.url && run.final.status !== 'rendering';
+  const busyAfterDone = done && run.scenes.some((s) => s.clip.status === 'queued' || s.clip.status === 'rendering');
+  // Weighted progress: plan 10 %, pictures 25 %, film 35 %, music + voice 20 %, final 10 %.
+  let pct = run.plan ? 10 : 3;
+  pct += 25 * (decided / n) + 35 * (filmed / n) + 10 * (voiced / n) + (scored ? 10 : 0);
+  if (done) pct = 100;
+  else pct = Math.min(96, pct);
+  let step = 0;
+  if (done) step = 4;
+  else if (!run.plan) step = 0;
+  else if (decided < n) step = 1;
+  else if (filmed < n) step = 2;
+  else step = 3;
+  const failed = run.status === 'error' && !done;
+  const title = failed
+    ? 'Something went wrong. Try again or ask for a change.'
+    : busyAfterDone || run.final.status === 'rendering'
+      ? 'Updating your ad…'
+      : done
+        ? 'Your ad is ready 🎉'
+        : `${PROGRESS_STEPS[step]}…`;
+  setText($('#pc-title'), title);
+  setText($('#pc-pct'), `${Math.round(pct)}%`);
+  $('#pc-bar').style.width = `${pct.toFixed(1)}%`;
+  reconcile(
+    $('#pc-steps'),
+    PROGRESS_STEPS,
+    (x) => x,
+    (x) => h('li', {}, x),
+    (el, x) => {
+      const i = PROGRESS_STEPS.indexOf(x);
+      cls(el, 'done', i < step || (done && i === step));
+      cls(el, 'active', i === step && !done);
+    },
+  );
+}
+
+function renderChat() {
+  const run = store.run;
+  const panel = $('#chat-panel');
+  panel.hidden = !run.plan;
+  if (!run.plan) return;
+  const busy =
+    run.final.status === 'rendering' ||
+    run.music.status === 'rendering' ||
+    run.scenes.some((s) => s.clip.status === 'queued' || s.clip.status === 'rendering' || s.voiceover.status === 'rendering');
+  const msgs = [];
+  run.directions.forEach((d, i) => {
+    const last = i === run.directions.length - 1;
+    msgs.push({ key: `u${i}`, who: 'me', text: d.instruction });
+    msgs.push({ key: `s${i}`, who: 'studio', text: d.summary || 'On it, updating your ad.' });
+    const ready = !last || (!busy && !!run.final.url && (d._finalV == null || (run.final.version || 0) > d._finalV));
+    if (ready) msgs.push({ key: `d${i}`, who: 'studio', kind: 'done', text: 'Done — your updated ad is ready ✓' });
+    else if (last) msgs.push({ key: `w${i}`, who: 'studio', kind: 'busy', text: 'Working on it…' });
+  });
+  if (ui.voiceSend) {
+    msgs.push({ key: 'vs', who: 'me', text: ui.voiceSend.text });
+    msgs.push({ key: 'vs-w', who: 'studio', kind: 'busy', text: 'Sending in a moment…' });
+  } else if (ui.pendingDirect) {
+    msgs.push({ key: `p:${ui.pendingDirect}`, who: 'me', text: ui.pendingDirect });
+    msgs.push({ key: `pw:${ui.pendingDirect}`, who: 'studio', kind: 'busy', text: 'Thinking about how to change your ad…' });
+  }
+  if (ui.directError && !ui.pendingDirect && !ui.voiceSend) msgs.push({ key: 'err', who: 'studio', kind: 'err', text: 'Sorry, that change didn\'t work. Please try again.' });
+  $('#chat-empty').hidden = msgs.length > 0;
+  const log = $('#chat-log');
+  const before = log.children.length;
+  reconcile(
+    log,
+    msgs,
+    (m) => m.key,
+    () => h('li', { class: 'bubble' }),
+    (el, m) => {
+      el.className = `bubble ${m.who}${m.kind ? ` ${m.kind}` : ''}`;
+      setText(el, m.text);
+    },
+  );
+  if (log.children.length !== before) log.scrollTop = log.scrollHeight;
+  $('#chat-send').disabled = !!ui.pendingDirect;
+}
+
+/** Simple ↔ "Behind the scenes" (pro) view. Default simple; `?pro=1` forces pro (for judges). */
+function initProToggle() {
+  const btn = $('#pro-toggle');
+  const setPro = (on, persist = true) => {
+    document.body.classList.toggle('pro', on);
+    btn.setAttribute('aria-pressed', String(on));
+    if (on) $('#more-opts').open = true;
+    if (persist) {
+      try {
+        localStorage.setItem(PRO_KEY, on ? '1' : '0');
+      } catch {
+        /* storage unavailable */
+      }
+    }
+    // Sig-cached panels (plan card, presentation slides) rebuild on the next render.
+    const plan = $('#plan-card');
+    if (plan) delete plan.dataset.sig;
+    markDirty();
+  };
+  btn.addEventListener('click', () => setPro(!isPro()));
+  let saved = null;
+  try {
+    saved = localStorage.getItem(PRO_KEY);
+  } catch {
+    saved = null;
+  }
+  const forced = new URLSearchParams(location.search).get('pro');
+  setPro(forced === '1' ? true : forced === '0' ? false : saved === '1', forced == null);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2848,6 +3017,24 @@ function initBriefPanel() {
     updateFanoutHint();
   });
 
+  // Length (simple view): Short / Standard / Long = 3 / 4 / 6 scenes; keeps the pro stepper in sync.
+  $('#length-toggle').addEventListener('click', (ev) => {
+    const b = ev.target.closest('button[data-scenes]');
+    if (!b) return;
+    const v = Number(b.dataset.scenes);
+    brief.n_scenes = v;
+    for (const x of $$('#length-toggle button')) {
+      cls(x, 'on', x === b);
+      x.setAttribute('aria-checked', String(x === b));
+    }
+    const st = $('.stepper[data-stepper="n_scenes"]');
+    if (st) {
+      st.dataset.value = String(v);
+      setText($('output', st), String(v));
+    }
+    updateFanoutHint();
+  });
+
   // Steppers.
   for (const st of $$('.stepper')) {
     st.addEventListener('click', (ev) => {
@@ -2859,6 +3046,7 @@ function initBriefPanel() {
       st.dataset.value = String(v);
       setText($('output', st), String(v));
       brief[st.dataset.stepper] = v;
+      if (st.dataset.stepper === 'n_scenes') for (const x of $$('#length-toggle button')) cls(x, 'on', Number(x.dataset.scenes) === v);
       updateFanoutHint();
     });
   }
@@ -2994,7 +3182,7 @@ function setLaunchBusy(btn, busy) {
   btn.disabled = busy;
   btn.setAttribute('aria-busy', String(busy));
   cls(btn, 'busy', busy);
-  setText($('.launch-label', btn), busy ? 'Launching…' : 'Launch loop');
+  setText($('.launch-label', btn), busy ? 'Starting…' : 'Create my ad');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3126,7 +3314,7 @@ class VoiceCapture {
       if (!text) toast('No speech detected.', 'warn');
       else {
         this.onText(text);
-        toast(`Transcribed in ${fmtMs(res.latency_ms)} · ${res.model || 'transcribe'}`, 'ok');
+        toast(isPro() ? `Transcribed in ${fmtMs(res.latency_ms)} · ${res.model || 'transcribe'}` : 'Got it, we heard you.', 'ok');
       }
     } catch (err) {
       toast(`Transcription failed: ${err.message}`, 'error');
@@ -3173,15 +3361,15 @@ function slideSpecs(run) {
   const f = run.final;
   specs.push({ key: 'film', kind: 'film', sig: `${f.url}|${f.version}|${f.captions_url}`, hold: SLIDE_TIMED_MS, build: () => filmSlide(run) });
   // Campaign kit slide (static/posters.js plugin); skipped when the plugin isn't loaded or has no winners yet.
-  const kitItems = ((window.AdLoopPosters?.getState?.() || run.posters || {}).items || []).filter((it) => it.winner != null);
-  if (kitItems.length && window.AdLoopPosters?.renderSlide) {
+  const kitItems = ((window.AdMatePosters?.getState?.() || run.posters || {}).items || []).filter((it) => it.winner != null);
+  if (kitItems.length && window.AdMatePosters?.renderSlide) {
     specs.push({
       key: 'kit', kind: 'kit', hold: SLIDE_TIMED_MS,
       sig: `kit|${kitItems.map((it) => `${it.format}:${it.winner}`).join(',')}`,
-      build: () => { const el = h('section', { class: 'slide slide-kit' }); window.AdLoopPosters.renderSlide(el); return el; },
+      build: () => { const el = h('section', { class: 'slide slide-kit' }); window.AdMatePosters.renderSlide(el); return el; },
     });
   }
-  specs.push({ key: 'stats', kind: 'stats', sig: 'stats', hold: SLIDE_TIMED_MS + 2000, build: () => statsSlide(run) });
+  if (isPro()) specs.push({ key: 'stats', kind: 'stats', sig: 'stats', hold: SLIDE_TIMED_MS + 2000, build: () => statsSlide(run) });
   for (const [market, loc] of Object.entries(run.localizations)) {
     if (!loc.video_url && !loc.scenes.some((x) => x.url)) continue;
     specs.push({ key: `loc:${market}`, kind: 'loc', sig: `${loc.video_url}|${loc.scenes.length}|${loc.plan?.tagline}`, hold: SLIDE_TIMED_MS, build: () => locSlide(run, market, loc) });
@@ -3196,7 +3384,7 @@ function titleSlide(run) {
   return h(
     'section',
     { class: 'slide slide-title', style: { '--p0': palette[0] || '#7c5cff', '--p1': palette[1] || '#ff4fd8', '--p2': palette[2] || '#ffb547' } },
-    h('div', { class: 'eyebrow mono' }, `${brand.name || run.input.brand || 'AdLoop'} · ${run.scenes.length} scenes · ${run.input.aspect}`),
+    h('div', { class: 'eyebrow mono' }, `${brand.name || run.input.brand || 'AdMate Studio'} · ${run.scenes.length} scenes · ${run.input.aspect}`),
     h('h1', { class: 'grad-text' }, plan.campaign_name || 'Untitled campaign'),
     plan.tagline ? h('p', { class: 'slide-tagline' }, `“${plan.tagline}”`) : null,
     plan.cta ? h('span', { class: 'cta-chip big' }, plan.cta) : null,
@@ -3612,6 +3800,18 @@ function initGlobal() {
     ev.preventDefault();
     submitDirection($('#dir-input').value.trim());
   });
+  $('#chat-form').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const input = $('#chat-input');
+    const text = input.value.trim();
+    if (!text) return;
+    await submitDirection(text);
+    if (ui.pendingDirect === text) input.value = '';
+  });
+  $('#chat-input').addEventListener('keydown', (ev) => {
+    if (cancelSpokenDirection() && ev.key === 'Escape') ev.preventDefault();
+  });
+  initProToggle();
 
   new VoiceCapture({
     button: $('#brief-mic'),
@@ -3625,6 +3825,11 @@ function initGlobal() {
   new VoiceCapture({
     button: $('#dir-mic'),
     meter: $('#dir-meter'),
+    onText: queueSpokenDirection,
+  });
+  new VoiceCapture({
+    button: $('#chat-mic'),
+    meter: $('#chat-meter'),
     onText: queueSpokenDirection,
   });
 

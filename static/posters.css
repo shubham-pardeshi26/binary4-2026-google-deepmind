@@ -1,5 +1,5 @@
 /*
- * AdLoop · Campaign Kit plugin styles (POSTERS_CONTRACT §3) — pairs with static/posters.js.
+ * AdMate · Campaign Kit plugin styles (POSTERS_CONTRACT §3) — pairs with static/posters.js.
  *
  * Reuses the studio tokens from static/styles.css (--grad, --panel, --border, --f-head/--f-ui/--f-mono, --ease,
  * --spring …) so the section reads as native. Every selector is namespaced `pk-` (plus `.slide-kit` for the
@@ -248,3 +248,12 @@
 
 /* Honour `hidden` even if the studio's global `[hidden]` rule is ever dropped. */
 .pk-panel[hidden], .pk-panel [hidden], .pk-lightbox[hidden], .pk-lightbox [hidden] { display: none !important; }
+
+/* Simple view (default) vs "Behind the scenes" (body.pro). Defensive copies of the global utilities, scoped to the kit. */
+body:not(.pro) .pk-panel .pro-only,
+body:not(.pro) .pk-lightbox .pro-only,
+body:not(.pro) .pk-slide-poster .pro-only { display: none !important; }
+body.pro .pk-panel .simple-only,
+body.pro .pk-lightbox .simple-only { display: none !important; }
+.pk-panel .pk-dl[hidden] { display: none !important; }
+.pk-panel .pk-actions { flex-wrap: wrap; }

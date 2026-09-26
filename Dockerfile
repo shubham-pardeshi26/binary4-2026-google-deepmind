@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # -----------------------------------------------------------------------------
-# AdLoop — single-container image for Hugging Face Spaces (Docker SDK),
+# AdMate — single-container image for Hugging Face Spaces (Docker SDK),
 # Google Cloud Run and Render.
 #
 #   * python:3.11-slim base, system ffmpeg from apt (imageio-ffmpeg stays
@@ -24,7 +24,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root runtime user (HF Spaces runs containers as UID 1000).
-RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin adloop
+RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin admate
 
 WORKDIR /app
 
@@ -33,14 +33,14 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # Application code.
-COPY --chown=adloop:adloop app/ ./app/
-COPY --chown=adloop:adloop static/ ./static/
-COPY --chown=adloop:adloop scripts/ ./scripts/
+COPY --chown=admate:admate app/ ./app/
+COPY --chown=admate:admate static/ ./static/
+COPY --chown=admate:admate scripts/ ./scripts/
 
 # Writable runtime data (run folders, event logs, stitched cuts).
-RUN mkdir -p /app/data/runs && chown -R adloop:adloop /app/data
+RUN mkdir -p /app/data/runs && chown -R admate:admate /app/data
 
-USER adloop
+USER admate
 
 EXPOSE 7860
 
